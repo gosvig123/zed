@@ -124,6 +124,7 @@ impl Editor {
 
         // Allow inlay hover points to be updated even without modifier key
         if point_for_position.as_valid().is_none() {
+            eprintln!("Hovering over inlay at position: {:?}", point_for_position);
             // Hovering over inlay - check for hover tooltips
             update_inlay_link_and_hover_points(
                 snapshot,
@@ -327,6 +328,7 @@ pub fn update_inlay_link_and_hover_points(
             let inlay_hint_cache = editor.inlay_hint_cache();
             let excerpt_id = previous_valid_anchor.excerpt_id;
             if let Some(cached_hint) = inlay_hint_cache.hint_by_id(excerpt_id, hovered_hint.id) {
+                eprintln!("Found cached hint: {:?}", cached_hint);
                 // Check if we should process this hint for hover
                 let should_process_hint = match cached_hint.resolve_state {
                     ResolveState::CanResolve(_, _) => {
@@ -366,6 +368,15 @@ pub fn update_inlay_link_and_hover_points(
                         true // Process the hint
                     }
                     ResolveState::Resolving => {
+                        // Check if this hint was just resolved and needs hover
+                        if editor.check_resolved_inlay_hint_hover(
+                            hovered_hint.id,
+                            excerpt_id,
+                            window,
+                            cx,
+                        ) {
+                            return; // Hover was shown by check_resolved_inlay_hint_hover
+                        }
                         false // Don't process yet
                     }
                 };
@@ -383,6 +394,7 @@ pub fn update_inlay_link_and_hover_points(
                     match cached_hint.label {
                         project::InlayHintLabel::String(_) => {
                             if let Some(tooltip) = cached_hint.tooltip {
+                                eprintln!("Inlay hint has tooltip: {:?}", tooltip);
                                 hover_popover::hover_at_inlay(
                                     editor,
                                     InlayHover {
@@ -430,6 +442,7 @@ pub fn update_inlay_link_and_hover_points(
                                     range: highlight_start..highlight_end,
                                 };
                                 if let Some(tooltip) = hovered_hint_part.tooltip {
+                                    eprintln!("Inlay hint part has tooltip: {:?}", tooltip);
                                     hover_popover::hover_at_inlay(
                                         editor,
                                         InlayHover {

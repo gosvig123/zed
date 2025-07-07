@@ -627,8 +627,16 @@ impl InlayHintCache {
                     let mut cached_hint = cached_hint.clone();
                     cached_hint.resolve_state = ResolveState::Resolving;
                     drop(guard);
-                    self.resolve_hint(server_id, buffer_id, cached_hint, window, cx)
-                        .detach_and_log_err(cx);
+                    self.resolve_hint(
+                        server_id,
+                        buffer_id,
+                        excerpt_id,
+                        id,
+                        cached_hint,
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
                 }
             }
         }
@@ -638,6 +646,8 @@ impl InlayHintCache {
         &self,
         server_id: LanguageServerId,
         buffer_id: BufferId,
+        excerpt_id: ExcerptId,
+        inlay_id: InlayId,
         hint_to_resolve: InlayHint,
         window: &mut Window,
         cx: &mut Context<Editor>,
@@ -657,15 +667,16 @@ impl InlayHintCache {
                 editor.update(cx, |editor, cx| {
                     if let Some(excerpt_hints) = editor.inlay_hint_cache.hints.get(&excerpt_id) {
                         let mut guard = excerpt_hints.write();
-                        if let Some(cached_hint) = guard.hints_by_id.get_mut(&id) {
+                        if let Some(cached_hint) = guard.hints_by_id.get_mut(&inlay_id) {
                             if cached_hint.resolve_state == ResolveState::Resolving {
                                 resolved_hint.resolve_state = ResolveState::Resolved;
                                 *cached_hint = resolved_hint;
                             }
                         }
                     }
-                    // Notify to trigger UI update
-                    cx.notify();
+
+                    // Mark the hint as resolved and needing hover check
+                    editor.mark_inlay_hint_resolved(inlay_id, cx);
                 })?;
             }
 
