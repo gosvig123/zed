@@ -4664,4 +4664,172 @@ mod tests {
             "BUG FOUND: Project settings were overwritten when opening via command - original custom content was lost"
         );
     }
+
+    #[gpui::test]
+    async fn test_settings_autocomplete_breaks_after_reload(cx: &mut TestAppContext) {
+        // This test reproduces the bug described in issue #31850:
+        // Settings autocomplete breaks after workspace reload when project has .zed/settings.json
+
+        // Initialize the test environment
+        let app_state = init_test(cx);
+
+        // Initialize the filesystem
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(app_state.fs.clone(), cx);
+        });
+
+        // Initialize languages including JSON language server
+        let node_runtime = node_runtime::NodeRuntime::unavailable();
+        cx.update(|cx| {
+            languages::init(app_state.languages.clone(), node_runtime.clone(), cx);
+        });
+
+        // Wait for languages to be fully registered
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+
+        // Ensure JSON language is loaded
+        let json_language = cx
+            .update(|_cx| app_state.languages.language_for_name("JSON"))
+            .await
+            .expect("JSON language should be available");
+
+        // Set up a project with a .zed/settings.json file containing only "{}"
+        // This is the key condition that triggers the bug
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                Path::new("/project"),
+                json!({
+                    ".zed": {
+                        "settings.json": "{}"
+                    },
+                    "file.txt": "test content"
+                }),
+            )
+            .await;
+
+        // Also create user settings file
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                paths::config_dir(),
+                json!({
+                    "settings.json": r#"{"theme": "One Dark"}"#
+                }),
+            )
+            .await;
+
+        // Create a project and workspace
+        let project = Project::test(app_state.fs.clone(), [Path::new("/project")], cx).await;
+
+        // Ensure the project has the JSON language available
+        project.update(cx, |project, _| {
+            project.languages().add(json_language);
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        // Open user settings (equivalent to cmd-,)
+        workspace_window
+            .update(cx, |_workspace, window, cx| {
+                open_settings_file(
+                    paths::settings_file(),
+                    || settings::initial_user_settings_content().as_ref().into(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+
+        // Wait for settings to open and language detection to complete
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+
+        // Verify that the settings file now has JSON language assigned
+        let initial_has_json_language = workspace_window
+            .update(cx, |workspace, _, cx| {
+                let active_item = workspace.active_item(cx)?;
+                let editor = active_item.downcast::<Editor>()?;
+                let buffer = editor.read(cx).buffer().read(cx);
+                let singleton = buffer.as_singleton()?;
+                let buf = singleton.read(cx);
+                let language = buf.language()?;
+                Some(language.name().as_ref() == "JSON")
+            })
+            .unwrap()
+            .unwrap_or(false);
+
+        // Assert that initially the settings file has JSON language assigned
+        assert!(
+            initial_has_json_language,
+            "Settings file should have JSON language assigned after opening"
+        );
+
+        // Close the workspace window to simulate what happens during reload
+        let project = workspace_window
+            .update(cx, |workspace, _, _| workspace.project().clone())
+            .unwrap();
+
+        workspace_window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+
+        // Wait for window to close
+        cx.run_until_parked();
+
+        // Create a new workspace window with the same project
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        // Wait for new workspace to initialize
+        cx.run_until_parked();
+
+        // Try to reopen settings in the new workspace
+        workspace_window
+            .update(cx, |_workspace, window, cx| {
+                open_settings_file(
+                    paths::settings_file(),
+                    || settings::initial_user_settings_content().as_ref().into(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+
+        // Wait for settings to reopen and language detection to complete
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        cx.background_executor.run_until_parked();
+
+        // Check if the buffer still has JSON language after reload
+        let post_reload_has_json_language = workspace_window
+            .update(cx, |workspace, _, cx| {
+                let active_item = workspace.active_item(cx)?;
+                let editor = active_item.downcast::<Editor>()?;
+                let buffer = editor.read(cx).buffer().read(cx);
+                let singleton = buffer.as_singleton()?;
+                let buf = singleton.read(cx);
+                let language = buf.language()?;
+                Some(language.name().as_ref() == "JSON")
+            })
+            .unwrap()
+            .unwrap_or(false);
+
+        // This assertion should FAIL, demonstrating the bug
+        assert!(
+            post_reload_has_json_language,
+            "Settings file lost its JSON language assignment after workspace recreation, breaking autocomplete"
+        );
+    }
 }
