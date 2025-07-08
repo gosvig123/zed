@@ -4315,6 +4315,26 @@ impl LspStore {
 
         let content = buffer.as_rope();
         let available_language = self.languages.language_for_file(file, Some(content), cx);
+
+        // If language detection failed (e.g., for files in invisible worktrees),
+        // try to detect language by full path
+        if available_language.is_none() {
+            let path = file.full_path(cx);
+
+            // Try async language detection by path
+            let languages = self.languages.clone();
+            let buffer = buffer_handle.clone();
+            cx.spawn(async move |this, cx| {
+                if let Some(language) = languages.language_for_file_path(&path).await.log_err() {
+                    this.update(cx, |this, cx| {
+                        this.set_language_for_buffer(&buffer, language, cx);
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
+
         if let Some(available_language) = &available_language {
             if let Some(Ok(Ok(new_language))) = self
                 .languages
