@@ -1,4 +1,5 @@
 pub mod clangd_ext;
+mod inlay_hint_cache;
 pub mod lsp_ext_command;
 pub mod rust_analyzer_ext;
 
@@ -10,7 +11,7 @@ use crate::{
     buffer_store::{BufferStore, BufferStoreEvent},
     environment::ProjectEnvironment,
     lsp_command::{self, *},
-    lsp_store,
+    lsp_store::{self, inlay_hint_cache::InlayHintCache},
     manifest_tree::{
         AdapterQuery, LanguageServerTree, LanguageServerTreeNode, LaunchDisposition,
         ManifestQueryDelegate, ManifestTree,
@@ -3551,7 +3552,8 @@ pub struct LspStore {
     _maintain_buffer_languages: Task<()>,
     diagnostic_summaries:
         HashMap<WorktreeId, HashMap<Arc<Path>, HashMap<LanguageServerId, DiagnosticSummary>>>,
-    lsp_data: HashMap<BufferId, DocumentColorData>,
+    color_data: HashMap<BufferId, LspDocumentColorData>,
+    inlay_hints: HashMap<BufferId, LspInlayHintData>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -3563,11 +3565,17 @@ pub struct DocumentColors {
 type DocumentColorTask = Shared<Task<std::result::Result<DocumentColors, Arc<anyhow::Error>>>>;
 
 #[derive(Debug, Default)]
-struct DocumentColorData {
+struct LspDocumentColorData {
     colors_for_version: Global,
     colors: HashMap<LanguageServerId, HashSet<DocumentColor>>,
     cache_version: usize,
     colors_update: Option<(Global, DocumentColorTask)>,
+}
+
+#[derive(Debug, Default)]
+struct LspInlayHintData {
+    hints_for_version: Global,
+    hints: HashMap<LanguageServerId, InlayHintCache>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -3804,7 +3812,8 @@ impl LspStore {
             language_server_statuses: Default::default(),
             nonce: StdRng::from_entropy().r#gen(),
             diagnostic_summaries: HashMap::default(),
-            lsp_data: HashMap::default(),
+            color_data: HashMap::default(),
+            inlay_hints: HashMap::default(),
             active_entry: None,
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
@@ -3861,7 +3870,8 @@ impl LspStore {
             language_server_statuses: Default::default(),
             nonce: StdRng::from_entropy().r#gen(),
             diagnostic_summaries: HashMap::default(),
-            lsp_data: HashMap::default(),
+            color_data: HashMap::default(),
+            inlay_hints: HashMap::default(),
             active_entry: None,
             toolchain_store,
             _maintain_workspace_config,
@@ -4162,7 +4172,8 @@ impl LspStore {
                         *refcount
                     };
                     if refcount == 0 {
-                        lsp_store.lsp_data.remove(&buffer_id);
+                        lsp_store.color_data.remove(&buffer_id);
+                        lsp_store.inlay_hints.remove(&buffer_id);
                         let local = lsp_store.as_local_mut().unwrap();
                         local.registered_buffers.remove(&buffer_id);
                         local.buffers_opened_in_servers.remove(&buffer_id);
@@ -6609,7 +6620,7 @@ impl LspStore {
             ColorFetchStrategy::UseCache {
                 known_cache_version,
             } => {
-                if let Some(cached_data) = self.lsp_data.get(&buffer_id) {
+                if let Some(cached_data) = self.color_data.get(&buffer_id) {
                     if !version_queried_for.changed_since(&cached_data.colors_for_version) {
                         let has_different_servers = self.as_local().is_some_and(|local| {
                             local
@@ -6642,7 +6653,7 @@ impl LspStore {
             }
         }
 
-        let lsp_data = self.lsp_data.entry(buffer_id).or_default();
+        let lsp_data = self.color_data.entry(buffer_id).or_default();
         if let Some((updating_for, running_update)) = &lsp_data.colors_update {
             if !version_queried_for.changed_since(&updating_for) {
                 return Some(running_update.clone());
@@ -6679,7 +6690,7 @@ impl LspStore {
                         lsp_store
                             .update(cx, |lsp_store, _| {
                                 lsp_store
-                                    .lsp_data
+                                    .color_data
                                     .entry(buffer_id)
                                     .or_default()
                                     .colors_update = None;
@@ -6691,7 +6702,7 @@ impl LspStore {
 
                 lsp_store
                     .update(cx, |lsp_store, _| {
-                        let lsp_data = lsp_store.lsp_data.entry(buffer_id).or_default();
+                        let lsp_data = lsp_store.color_data.entry(buffer_id).or_default();
 
                         if lsp_data.colors_for_version == query_version_queried_for {
                             lsp_data.colors.extend(fetched_colors.clone());
@@ -11221,9 +11232,12 @@ impl LspStore {
     }
 
     fn cleanup_lsp_data(&mut self, for_server: LanguageServerId) {
-        for buffer_lsp_data in self.lsp_data.values_mut() {
-            buffer_lsp_data.colors.remove(&for_server);
-            buffer_lsp_data.cache_version += 1;
+        for color_data in self.color_data.values_mut() {
+            color_data.colors.remove(&for_server);
+            color_data.cache_version += 1;
+        }
+        for hint_data in self.inlay_hints.values_mut() {
+            hint_data.hints.remove(&for_server);
         }
         if let Some(local) = self.as_local_mut() {
             local.buffer_pull_diagnostics_result_ids.remove(&for_server);
