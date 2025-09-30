@@ -429,10 +429,8 @@ pub fn initialize_workspace(
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
-            // Invisible utility that shows inline symbol reference-count hints in the active file.
             status_bar.add_right_item(symbol_ref_hints_for_status, window, cx);
         });
-        // Register actions that depend on the status item handle
         workspace.register_action({
             move |workspace, _: &ToggleSymbolRefHints, _window, cx| {
                 let new_enabled = symbol_ref_hints.update(cx, |s, _| {
@@ -442,19 +440,11 @@ pub fn initialize_workspace(
                 if let Some(editor) = workspace.active_item_as::<Editor>(cx) {
                     let core_inlays_on = editor.read(cx).inlay_hints_enabled();
                     if !new_enabled || !core_inlays_on {
-                        let _ = editor.update(cx, |ed, cx| {
+                        editor.update(cx, |editor, cx| {
                             let to_remove: Vec<editor::InlayId> = (0..1024)
-                                .map(|i| editor::InlayId::DebuggerValue(900_000_000 + i))
+                                .map(|i| editor::InlayId::SymbolRefHint(900_000_000 + i))
                                 .collect();
-                            ed.splice_inlays(&to_remove, Vec::new(), cx);
-                        });
-                    } else {
-                        let _ = editor.update(cx, |ed, cx| {
-                            ed.buffer().update(cx, |mb, cx| {
-                                if let Some(buffer) = mb.as_singleton() {
-                                    buffer.update(cx, |b, cx| b.reparse(cx));
-                                }
-                            });
+                            editor.splice_inlays(&to_remove, Vec::new(), cx);
                         });
                     }
                 }

@@ -281,6 +281,7 @@ impl InlineValueCache {
 pub enum InlayId {
     EditPrediction(usize),
     DebuggerValue(usize),
+    SymbolRefHint(usize),
     // LSP
     Hint(usize),
     Color(usize),
@@ -291,6 +292,7 @@ impl InlayId {
         match self {
             Self::EditPrediction(id) => *id,
             Self::DebuggerValue(id) => *id,
+            Self::SymbolRefHint(id) => *id,
             Self::Hint(id) => *id,
             Self::Color(id) => *id,
         }
