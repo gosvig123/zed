@@ -19,8 +19,8 @@ pub struct SymbolRefHints {
     refresh_rev: u64,
 }
 
-const HINT_BASE_ID: usize = 900_000_000; // avoid collisions with other inlays
-const MAX_REMOVE: usize = 1024; // remove up to this many old hints each refresh
+const HINT_BASE_ID: u32 = 900_000_000; // avoid collisions with other inlays
+const MAX_REMOVE: u32 = 1024; // remove up to this many old hints each refresh
 
 impl SymbolRefHints {
     pub fn new(workspace: &Workspace) -> Self {
@@ -231,7 +231,11 @@ impl SymbolRefHints {
                             let position = multi_buffer_snapshot
                                 .anchor_in_excerpt(excerpt_id, item.range.start)?;
                             let text = format!("{} ", counts[i]);
-                            Some(Inlay::symbol_ref_hint(HINT_BASE_ID + i, position, text))
+                            Some(Inlay::symbol_ref_hint(
+                                HINT_BASE_ID + i as u32,
+                                position,
+                                text,
+                            ))
                         })
                         .collect::<Vec<Inlay>>()
                 })

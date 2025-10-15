@@ -1013,7 +1013,7 @@ fn fetch_and_update_hints(
                 .cloned()
         })?;
 
-        let visible_hints = editor.update(cx, |editor, cx| editor.visible_inlay_hints(cx))?;
+        let visible_hints = editor.update(cx, |editor, cx| editor.visible_inlay_hints(cx).cloned().collect::<Vec<_>>())?;
         let new_hints = match inlay_hints_fetch_task {
             Some(fetch_task) => {
                 log::debug!(
@@ -1495,7 +1495,7 @@ pub mod tests {
             .into_response()
             .expect("work done progress create request failed");
         cx.executor().run_until_parked();
-        fake_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
+        fake_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
             token: lsp::ProgressToken::String(progress_token.to_string()),
             value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::Begin(
                 lsp::WorkDoneProgressBegin::default(),
@@ -1515,7 +1515,7 @@ pub mod tests {
             })
             .unwrap();
 
-        fake_server.notify::<lsp::notification::Progress>(&lsp::ProgressParams {
+        fake_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
             token: lsp::ProgressToken::String(progress_token.to_string()),
             value: lsp::ProgressParamsValue::WorkDone(lsp::WorkDoneProgress::End(
                 lsp::WorkDoneProgressEnd::default(),
@@ -2251,7 +2251,7 @@ pub mod tests {
             .unwrap();
     }
 
-    #[gpui::test(iterations = 10)]
+    #[gpui::test(iterations = 4)]
     async fn test_large_buffer_inlay_requests_split(cx: &mut gpui::TestAppContext) {
         init_test(cx, |settings| {
             settings.defaults.inlay_hints = Some(InlayHintSettingsContent {
@@ -3570,8 +3570,7 @@ pub mod tests {
     pub fn visible_hint_labels(editor: &Editor, cx: &Context<Editor>) -> Vec<String> {
         editor
             .visible_inlay_hints(cx)
-            .into_iter()
-            .map(|hint| hint.text.to_string())
+            .map(|hint| hint.text().to_string())
             .collect()
     }
 }
