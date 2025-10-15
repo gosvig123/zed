@@ -52,7 +52,9 @@ impl SymbolRefHints {
     }
 
     fn is_singleton(editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
-        editor.read_with(cx, |editor, app| editor.buffer().read(app).as_singleton().is_some())
+        editor.read_with(cx, |editor, app| {
+            editor.buffer().read(app).as_singleton().is_some()
+        })
     }
 
     fn inlays_enabled(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
@@ -226,8 +228,8 @@ impl SymbolRefHints {
                         .into_iter()
                         .enumerate()
                         .filter_map(|(i, item)| {
-                            let position =
-                                multi_buffer_snapshot.anchor_in_excerpt(excerpt_id, item.range.start)?;
+                            let position = multi_buffer_snapshot
+                                .anchor_in_excerpt(excerpt_id, item.range.start)?;
                             let text = format!("{} ", counts[i]);
                             Some(Inlay::symbol_ref_hint(HINT_BASE_ID + i, position, text))
                         })
@@ -293,8 +295,9 @@ impl StatusItemView for SymbolRefHints {
                 move |this, window, cx| {
                     let our_enabled = this.enabled;
                     let inlay_enabled = editor_for_settings.read(cx).inlay_hints_enabled();
-                    let is_singleton = editor_for_settings
-                        .read_with(cx, |editor, app| editor.buffer().read(app).as_singleton().is_some());
+                    let is_singleton = editor_for_settings.read_with(cx, |editor, app| {
+                        editor.buffer().read(app).as_singleton().is_some()
+                    });
                     if !(our_enabled && inlay_enabled) || !is_singleton {
                         this.bump_and_clear(&editor_for_settings, cx);
                         this.cancel_task();
@@ -307,16 +310,6 @@ impl StatusItemView for SymbolRefHints {
 
             let debounce = self.edit_debounce(&editor, cx);
             self.refresh_symbol_ref_hints(&editor, window, cx, debounce);
-
-            if self.enabled && editor.read(cx).inlay_hints_enabled() {
-                editor.update(cx, |editor, cx| {
-                    editor.buffer().update(cx, |multi_buffer, cx| {
-                        if let Some(buffer) = multi_buffer.as_singleton() {
-                            buffer.update(cx, |buffer, cx| buffer.reparse(cx));
-                        }
-                    });
-                });
-            }
         } else {
             self._observe_active_editor = None;
             self._observe_settings = None;
