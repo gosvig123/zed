@@ -6,6 +6,7 @@ pub(crate) mod mac_only_instance;
 mod migrate;
 mod open_listener;
 mod quick_action_bar;
+pub(crate) mod symbol_ref_hints;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
@@ -120,6 +121,8 @@ actions!(
         ToggleFullScreen,
         /// Zooms the window.
         Zoom,
+        /// Toggle Symbol Ref Hints (inline symbol reference-count hints)
+        ToggleSymbolRefHints,
         /// Triggers a test panic for debugging.
         TestPanic,
         /// Triggers a hard crash for debugging.
@@ -413,6 +416,8 @@ pub fn initialize_workspace(
 
         let cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
+        let symbol_ref_hints = cx.new(|_| symbol_ref_hints::SymbolRefHints::new(workspace));
+        let symbol_ref_hints_for_status = symbol_ref_hints.clone();
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
@@ -424,6 +429,26 @@ pub fn initialize_workspace(
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+            status_bar.add_right_item(symbol_ref_hints_for_status, window, cx);
+        });
+        workspace.register_action({
+            move |workspace, _: &ToggleSymbolRefHints, _window, cx| {
+                let new_enabled = symbol_ref_hints.update(cx, |s, _| {
+                    s.enabled = !s.enabled;
+                    s.enabled
+                });
+                if let Some(editor) = workspace.active_item_as::<Editor>(cx) {
+                    let core_inlays_on = editor.read(cx).inlay_hints_enabled();
+                    if !new_enabled || !core_inlays_on {
+                        editor.update(cx, |editor, cx| {
+                            let to_remove: Vec<editor::InlayId> = (0..1024)
+                                .map(|i| editor::InlayId::SymbolRefHint(900_000_000 + i))
+                                .collect();
+                            editor.splice_inlays(&to_remove, Vec::new(), cx);
+                        });
+                    }
+                }
+            }
         });
 
         let handle = cx.entity().downgrade();

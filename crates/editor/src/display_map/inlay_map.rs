@@ -99,6 +99,15 @@ impl Inlay {
         }
     }
 
+    pub fn symbol_ref_hint<T: Into<Rope>>(id: usize, position: Anchor, text: T) -> Self {
+        Self {
+            id: InlayId::SymbolRefHint(id),
+            position,
+            text: text.into(),
+            color: None,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn get_color(&self) -> Option<Hsla> {
         self.color
@@ -362,6 +371,7 @@ impl<'a> Iterator for InlayChunks<'a> {
                     }),
                     InlayId::Hint(_) => self.highlight_styles.inlay_hint,
                     InlayId::DebuggerValue(_) => self.highlight_styles.inlay_hint,
+                    InlayId::SymbolRefHint(_) => self.highlight_styles.inlay_hint,
                     InlayId::Color(_) => {
                         if let Some(color) = inlay.color {
                             renderer = Some(ChunkRenderer {

@@ -281,6 +281,7 @@ impl InlineValueCache {
 pub enum InlayId {
     EditPrediction(usize),
     DebuggerValue(usize),
+    SymbolRefHint(usize),
     // LSP
     Hint(usize),
     Color(usize),
@@ -291,6 +292,7 @@ impl InlayId {
         match self {
             Self::EditPrediction(id) => *id,
             Self::DebuggerValue(id) => *id,
+            Self::SymbolRefHint(id) => *id,
             Self::Hint(id) => *id,
             Self::Color(id) => *id,
         }
@@ -5147,10 +5149,12 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refresh_inlay_hints(
-            InlayHintRefreshReason::Toggle(!self.inlay_hints_enabled()),
-            cx,
-        );
+        let new_enabled = !self.inlay_hints_enabled();
+        cx.emit(EditorEvent::InlayHintsToggled {
+            enabled: new_enabled,
+        });
+
+        self.refresh_inlay_hints(InlayHintRefreshReason::Toggle(new_enabled), cx);
     }
 
     pub fn inlay_hints_enabled(&self) -> bool {
@@ -23396,6 +23400,9 @@ pub enum EditorEvent {
     InputHandled {
         utf16_range_to_replace: Option<Range<isize>>,
         text: Arc<str>,
+    },
+    InlayHintsToggled {
+        enabled: bool,
     },
     ExcerptsAdded {
         buffer: Entity<Buffer>,
