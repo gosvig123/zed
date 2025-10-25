@@ -1815,7 +1815,10 @@ async fn test_disk_based_diagnostics_progress(cx: &mut gpui::TestAppContext) {
     fake_server
         .start_progress(format!("{}/0", progress_token))
         .await;
-    assert_eq!(events.next().await.unwrap(), Event::RefreshInlayHints);
+    assert_eq!(
+        events.next().await.unwrap(),
+        Event::RefreshInlayHints(fake_server.server.server_id())
+    );
     assert_eq!(
         events.next().await.unwrap(),
         Event::DiskBasedDiagnosticsStarted {
@@ -1954,7 +1957,10 @@ async fn test_restarting_server_with_diagnostics_running(cx: &mut gpui::TestAppC
             Some(worktree_id)
         )
     );
-    assert_eq!(events.next().await.unwrap(), Event::RefreshInlayHints);
+    assert_eq!(
+        events.next().await.unwrap(),
+        Event::RefreshInlayHints(fake_server.server.server_id())
+    );
     fake_server.start_progress(progress_token).await;
     assert_eq!(
         events.next().await.unwrap(),
@@ -4245,6 +4251,73 @@ async fn test_save_as(cx: &mut gpui::TestAppContext) {
     assert_eq!(opened_buffer, buffer);
 }
 
+#[gpui::test]
+async fn test_save_as_existing_file(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+                "data_a.txt": "data about a"
+        }),
+    )
+    .await;
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/data_a.txt"), cx)
+        })
+        .await
+        .unwrap();
+
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(11..12, "b")], None, cx);
+    });
+
+    // Save buffer's contents as a new file and confirm that the buffer's now
+    // associated with `data_b.txt` instead of `data_a.txt`, confirming that the
+    // file associated with the buffer has now been updated to `data_b.txt`
+    project
+        .update(cx, |project, cx| {
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+            let new_path = ProjectPath {
+                worktree_id,
+                path: rel_path("data_b.txt").into(),
+            };
+
+            project.save_buffer_as(buffer.clone(), new_path, cx)
+        })
+        .await
+        .unwrap();
+
+    buffer.update(cx, |buffer, cx| {
+        assert_eq!(
+            buffer.file().unwrap().full_path(cx),
+            Path::new("dir/data_b.txt")
+        )
+    });
+
+    // Open the original `data_a.txt` file, confirming that its contents are
+    // unchanged and the resulting buffer's associated file is `data_a.txt`.
+    let original_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/data_a.txt"), cx)
+        })
+        .await
+        .unwrap();
+
+    original_buffer.update(cx, |buffer, cx| {
+        assert_eq!(buffer.text(), "data about a");
+        assert_eq!(
+            buffer.file().unwrap().full_path(cx),
+            Path::new("dir/data_a.txt")
+        )
+    });
+}
+
 #[gpui::test(retries = 5)]
 async fn test_rescan_and_remote_updates(cx: &mut gpui::TestAppContext) {
     use worktree::WorktreeModelHandle as _;
@@ -4307,7 +4380,7 @@ async fn test_rescan_and_remote_updates(cx: &mut gpui::TestAppContext) {
     let remote = cx.update(|cx| {
         Worktree::remote(
             0,
-            1,
+            ReplicaId::REMOTE_SERVER,
             metadata,
             project.read(cx).client().into(),
             project.read(cx).path_style(cx),
@@ -8846,7 +8919,7 @@ async fn test_file_status(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-#[cfg_attr(target_os = "windows", ignore)]
+#[ignore]
 async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();
@@ -8930,10 +9003,7 @@ async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         repository_updates.lock().drain(..).collect::<Vec<_>>(),
         vec![
-            RepositoryEvent::Updated {
-                full_scan: true,
-                new_instance: false,
-            },
+            RepositoryEvent::StatusesChanged { full_scan: true },
             RepositoryEvent::MergeHeadsChanged,
         ],
         "Initial worktree scan should produce a repo update event"
@@ -8994,7 +9064,6 @@ async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
         repository_updates
             .lock()
             .iter()
-            .filter(|update| !matches!(update, RepositoryEvent::PathsChanged))
             .cloned()
             .collect::<Vec<_>>(),
         Vec::new(),
@@ -9098,17 +9167,10 @@ async fn test_odd_events_for_ignored_dirs(
     });
 
     assert_eq!(
-        repository_updates
-            .lock()
-            .drain(..)
-            .filter(|update| !matches!(update, RepositoryEvent::PathsChanged))
-            .collect::<Vec<_>>(),
+        repository_updates.lock().drain(..).collect::<Vec<_>>(),
         vec![
-            RepositoryEvent::Updated {
-                full_scan: true,
-                new_instance: false,
-            },
             RepositoryEvent::MergeHeadsChanged,
+            RepositoryEvent::BranchChanged
         ],
         "Initial worktree scan should produce a repo update event"
     );
@@ -9136,7 +9198,6 @@ async fn test_odd_events_for_ignored_dirs(
         repository_updates
             .lock()
             .iter()
-            .filter(|update| !matches!(update, RepositoryEvent::PathsChanged))
             .cloned()
             .collect::<Vec<_>>(),
         Vec::new(),
@@ -9653,6 +9714,7 @@ fn python_lang(fs: Arc<FakeFs>) -> Arc<Language> {
             worktree_root: PathBuf,
             subroot_relative_path: Arc<RelPath>,
             _: Option<HashMap<String, String>>,
+            _: &dyn Fs,
         ) -> ToolchainList {
             // This lister will always return a path .venv directories within ancestors
             let ancestors = subroot_relative_path.ancestors().collect::<Vec<_>>();
@@ -9677,6 +9739,7 @@ fn python_lang(fs: Arc<FakeFs>) -> Arc<Language> {
             &self,
             _: PathBuf,
             _: Option<HashMap<String, String>>,
+            _: &dyn Fs,
         ) -> anyhow::Result<Toolchain> {
             Err(anyhow::anyhow!("Not implemented"))
         }
@@ -9689,7 +9752,7 @@ fn python_lang(fs: Arc<FakeFs>) -> Arc<Language> {
                 manifest_name: ManifestName::from(SharedString::new_static("pyproject.toml")),
             }
         }
-        async fn activation_script(&self, _: &Toolchain, _: ShellKind, _: &dyn Fs) -> Vec<String> {
+        fn activation_script(&self, _: &Toolchain, _: ShellKind) -> Vec<String> {
             vec![]
         }
     }

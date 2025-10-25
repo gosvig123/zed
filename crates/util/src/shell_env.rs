@@ -35,8 +35,8 @@ async fn capture_unix(
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
-    let zed_path = super::get_shell_safe_zed_path()?;
     let shell_kind = ShellKind::new(shell_path, false);
+    let zed_path = super::get_shell_safe_zed_path(shell_kind)?;
 
     let mut command_string = String::new();
     let mut command = std::process::Command::new(shell_path);
@@ -177,8 +177,12 @@ async fn capture_windows(
                 .args([
                     "-c",
                     &format!(
-                        "cd '{}'; {} --printenv",
+                        "cd '{}'; {}{} --printenv",
                         directory.display(),
+                        shell_kind
+                            .command_prefix()
+                            .map(|prefix| prefix.to_string())
+                            .unwrap_or_default(),
                         zed_path.display()
                     ),
                 ])
