@@ -1125,6 +1125,8 @@ pub struct AgentPanel {
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
     base_view: BaseView,
+    ticks_view: Entity<crate::ticks_view::TicksView>,
+    showing_ticks: bool,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1534,9 +1536,13 @@ impl AgentPanel {
         })
         .detach();
 
+        let ticks_view =
+            cx.new(|cx| crate::ticks_view::TicksView::new(workspace.clone(), fs.clone(), cx));
         let panel = Self {
             workspace_id,
             base_view,
+            ticks_view,
+            showing_ticks: false,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
             user_store,
@@ -4327,6 +4333,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.showing_ticks = false;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -5029,6 +5036,9 @@ impl Panel for AgentPanel {
     }
 
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.showing_ticks {
+            return self.ticks_view.focus_handle(cx);
+        }
         match self.visible_surface() {
             VisibleSurface::Uninitialized => self.focus_handle.clone(),
             VisibleSurface::AgentThread(conversation_view) => {
@@ -6514,8 +6524,45 @@ impl AgentPanel {
     }
 }
 
+impl AgentPanel {
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("agent-panel-tabs")
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .children(
+                [(false, "Chat"), (true, "Ticks")].map(|(showing_ticks, label)| {
+                    Button::new(label, label)
+                        .label_size(LabelSize::Small)
+                        .toggle_state(self.showing_ticks == showing_ticks)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.showing_ticks = showing_ticks;
+                            if showing_ticks {
+                                this.ticks_view.update(cx, |view, cx| view.refresh(cx));
+                            }
+                            this.activation_focus_handle(cx).focus(window, cx);
+                            cx.notify();
+                        }))
+                }),
+            )
+    }
+}
+
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.showing_ticks {
+            return v_flex()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .bg(cx.theme().colors().panel_background)
+                .child(self.render_tabs(cx))
+                .child(self.ticks_view.clone())
+                .into_any();
+        }
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
         //
@@ -6570,6 +6617,7 @@ impl Render for AgentPanel {
                     })
                 }
             }))
+            .child(self.render_tabs(cx))
             .child(self.render_toolbar(window, cx))
             .children(self.render_new_user_onboarding(window, cx))
             .map(|parent| match self.visible_surface() {

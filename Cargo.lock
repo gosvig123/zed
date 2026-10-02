@@ -508,6 +508,7 @@ dependencies = [
  "language_model",
  "language_models",
  "languages",
+ "libc",
  "log",
  "lru",
  "lsp",
@@ -557,6 +558,7 @@ dependencies = [
  "uuid",
  "vim",
  "watch",
+ "which",
  "workspace",
  "zed_actions",
 ]

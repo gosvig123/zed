@@ -23,6 +23,7 @@ mod message_editor;
 mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
+mod pi_tick;
 mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
@@ -34,6 +35,7 @@ pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
 
 pub mod threads_archive_view;
+mod ticks_view;
 mod ui;
 mod unicode_confusables;
 
