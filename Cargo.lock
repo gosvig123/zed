@@ -18218,6 +18218,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "task_shark_panel"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
+ "anyhow",
+ "db",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "menu",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
+ "uuid",
+ "which",
+ "workspace",
+]
+
+[[package]]
 name = "tasks_ui"
 version = "0.1.0"
 dependencies = [
@@ -22939,6 +22960,7 @@ dependencies = [
  "system_specs",
  "tab_switcher",
  "tabular_data_preview",
+ "task_shark_panel",
  "tasks_ui",
  "telemetry",
  "telemetry_events",
