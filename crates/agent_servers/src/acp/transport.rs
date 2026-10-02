@@ -9,7 +9,7 @@ use project::{Project, agent_server_store::AgentServerCommand};
 use remote::remote_client::Interactive;
 use std::{io, pin::Pin, process::Stdio};
 use task::{Shell, ShellBuilder};
-use util::{ResultExt as _, process::Child};
+use util::process::Child;
 
 pub(super) struct StdioProcess {
     pub child: Child,
@@ -34,7 +34,7 @@ pub(super) fn spawn_stdio(
     });
     let (path, arguments, environment) = project
         .read_with(cx, |project, cx| {
-            project.remote_client().and_then(|client| {
+            project.remote_client().map(|client| {
                 let template = client
                     .read(cx)
                     .build_command(
@@ -45,10 +45,10 @@ pub(super) fn spawn_stdio(
                         None,
                         Interactive::No,
                     )
-                    .log_err()?;
-                Some((template.program, template.args, template.env))
-            })
-        })
+                    .context("Failed to build remote agent command; reconnect to the remote project and try again")?;
+                anyhow::Ok((template.program, template.args, template.env))
+            }).transpose()
+        })?
         .unwrap_or_else(|| {
             (
                 command.path.display().to_string(),
