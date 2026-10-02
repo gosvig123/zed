@@ -695,6 +695,10 @@ fn fetch_sessions_for_agent(
     let mut wait_for_connection_tasks = Vec::new();
 
     for store in stores {
+        // Agents can scope session/list to the last loaded conversation's directory.
+        // Discovery needs a fresh connection so importing does not inherit that scope.
+        let project = store.read(cx).project().clone();
+        let store = cx.new(|cx| AgentConnectionStore::new(project, cx));
         let remote_connection = store
             .read(cx)
             .project()
@@ -707,7 +711,7 @@ fn fetch_sessions_for_agent(
         wait_for_connection_tasks.push(entry.read(cx).wait_for_connection().map({
             let agent_id = agent_id.clone();
             let remote_connection = remote_connection.clone();
-            move |result| (agent_id, remote_connection, result)
+            move |result| (agent_id, remote_connection, result, store)
         }));
     }
 
@@ -716,7 +720,7 @@ fn fetch_sessions_for_agent(
         let results = futures::future::join_all(wait_for_connection_tasks).await;
 
         let mut page_tasks = Vec::new();
-        for (agent_id, remote_connection, result) in results {
+        for (agent_id, remote_connection, result, store) in results {
             let state = match result {
                 Ok(state) => state,
                 Err(error) => {
@@ -736,6 +740,7 @@ fn fetch_sessions_for_agent(
                 let list = list.clone();
                 let agent_id_for_error = agent_id.clone();
                 async move |cx| {
+                    let _discovery_store = store;
                     (
                         agent_id_for_error,
                         collect_all_sessions(agent_id, remote_connection, list, cx).await,
