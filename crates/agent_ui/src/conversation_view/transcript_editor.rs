@@ -12,7 +12,7 @@ use editor::{
     },
     scroll::Autoscroll,
 };
-use editor::{HighlightKey, RowHighlightOptions};
+use editor::HighlightKey;
 use gpui::{
     App, Context, Entity, EntityId, Focusable as _, IntoElement, Render, Subscription, WeakEntity,
     Window, prelude::*, px,
@@ -1059,21 +1059,6 @@ impl TranscriptEditor {
         let markup = &self.markup;
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            editor.clear_row_highlights::<CodeBlockRows>();
-            for (segment_markup, segment_range) in markup.iter().zip(offsets) {
-                for code in &segment_markup.code {
-                    let start =
-                        snapshot.anchor_after(MultiBufferOffset(segment_range.start + code.start));
-                    let end =
-                        snapshot.anchor_before(MultiBufferOffset(segment_range.start + code.end));
-                    editor.highlight_rows::<CodeBlockRows>(
-                        start..end,
-                        |cx| cx.theme().colors().editor_subheader_background,
-                        RowHighlightOptions::default(),
-                        cx,
-                    );
-                }
-            }
             for (style, highlight) in styles {
                 let ranges = markup
                     .iter()
@@ -1204,7 +1189,7 @@ fn block_specs_for(
         };
         let markdown = cx.new(|cx| {
             Markdown::new_with_options(
-                source.to_string().into(),
+                dedent_nested_block(&segment.text, rich.start, source).into(),
                 Some(languages.clone()),
                 None,
                 MarkdownOptions {
@@ -1228,6 +1213,24 @@ fn block_specs_for(
         });
     }
     specs
+}
+
+/// A block inside a list item starts at its list indent, and its later lines still carry
+/// that indent, which would read as part of the code once the block is parsed alone.
+fn dedent_nested_block(text: &str, start: usize, source: &str) -> String {
+    let line_start = text
+        .get(..start)
+        .and_then(|before| before.rfind('\n'))
+        .map_or(0, |newline| newline + 1);
+    let indent = start.saturating_sub(line_start);
+    let mut lines = source.split('\n');
+    let mut dedented = lines.next().unwrap_or_default().to_string();
+    for line in lines {
+        let spaces = line.bytes().take(indent).take_while(|&byte| byte == b' ').count();
+        dedented.push('\n');
+        dedented.push_str(&line[spaces..]);
+    }
+    dedented
 }
 
 struct BlockSpec {
@@ -1704,7 +1707,7 @@ impl ProseStyle {
                 ..Default::default()
             },
             Self::Code => HighlightStyle {
-                background_color: Some(colors.element_background),
+                background_color: Some(colors.editor_foreground.opacity(0.08)),
                 ..Default::default()
             },
             Self::Link => HighlightStyle {
@@ -1726,14 +1729,9 @@ struct SegmentMarkup {
     /// Markdown syntax to hide, each with the glyph shown in its place, if any.
     hidden: Vec<(Range<usize>, Option<&'static str>)>,
     styled: Vec<(Range<usize>, ProseStyle)>,
-    /// Tables and diagrams, rendered as blocks in place of their source.
+    /// Tables and code blocks, rendered as blocks in place of their source.
     rich: Vec<Range<usize>>,
-    /// The lines of fenced code blocks, shown on a background.
-    code: Vec<Range<usize>>,
 }
-
-/// Row highlights for the lines of fenced code blocks.
-struct CodeBlockRows;
 
 fn segment_markup(segment: &Segment) -> SegmentMarkup {
     let prose_start = match segment.kind {
@@ -1762,7 +1760,6 @@ fn segment_markup(segment: &Segment) -> SegmentMarkup {
             .map(|(range, style)| (shift(range), style))
             .collect(),
         rich: markup.rich.into_iter().map(shift).collect(),
-        code: markup.code.into_iter().map(shift).collect(),
     }
 }
 
@@ -1793,7 +1790,6 @@ fn prose_markup(text: &str) -> SegmentMarkup {
     let mut extra_hidden = Vec::new();
     let mut extra_styled = Vec::new();
     let mut rich: Vec<Range<usize>> = Vec::new();
-    let mut code = Vec::new();
 
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
@@ -1835,29 +1831,9 @@ fn prose_markup(text: &str) -> SegmentMarkup {
                     .map_or(range.end, |newline| range.start + newline);
                 extra_styled.push((range.start + hashes + spaces..line_end, ProseStyle::Heading));
             }
-            Event::Start(Tag::Table(_)) => rich.push(trim_trailing_newlines(text, range)),
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(language)))
-                if language.split_whitespace().next() == Some("mermaid") =>
-            {
+            // Code needs the buffer font to keep its columns, and the editor has one font.
+            Event::Start(Tag::Table(_) | Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
                 rich.push(trim_trailing_newlines(text, range))
-            }
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
-                let range = trim_trailing_newlines(text, range);
-                let block = &text[range.clone()];
-                let Some(opening_end) = block.find('\n') else {
-                    continue;
-                };
-                extra_hidden.push((range.start..range.start + opening_end + 1, None));
-                let mut code_end = range.end;
-                let closing = block.rfind('\n').filter(|&closing| {
-                    closing > opening_end
-                        && block[closing + 1..].trim_start().starts_with(['`', '~'])
-                });
-                if let Some(closing) = closing {
-                    code_end = range.start + closing;
-                    extra_hidden.push((code_end..range.end, None));
-                }
-                code.push(range.start + opening_end + 1..code_end);
             }
             Event::Start(Tag::Item)
                 if matches!(bytes.get(range.start), Some(b'-' | b'*' | b'+'))
@@ -1894,7 +1870,6 @@ fn prose_markup(text: &str) -> SegmentMarkup {
         hidden,
         styled,
         rich,
-        code,
     }
 }
 
