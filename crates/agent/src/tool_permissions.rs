@@ -615,6 +615,8 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            thread_layout: Default::default(),
+            cursor_after_send: Default::default(),
         }
     }
 

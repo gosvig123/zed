@@ -31,6 +31,7 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
+use editor::{DisplayPoint, display_map::DisplayRow};
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
@@ -41,9 +42,12 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
-use settings::{update_settings_file, update_settings_file_with_completion};
+use settings::{
+    AgentThreadLayout, CursorAfterSend, update_settings_file, update_settings_file_with_completion,
+};
+use std::ops::Range;
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    Avatar, ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
@@ -593,6 +597,17 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v1::ToolCallId>,
+    /// Activity groups the user expanded in the document layout, keyed by the first tool
+    /// call in the group so the state survives entries being inserted or removed above it.
+    expanded_activity_groups: HashSet<acp_v1::ToolCallId>,
+    /// Whether the message editor is the last item of `list_state` (document layout).
+    composer_in_list: bool,
+    applied_thread_layout: AgentThreadLayout,
+    /// The transcript as one read-only editor, in the editor layout.
+    transcript_editor: Option<Entity<super::transcript_editor::TranscriptEditor>>,
+    /// In the editor layout, the user message being rewritten in the composer. Sending
+    /// rewinds the thread to it.
+    pending_rewrite: Option<usize>,
     collapsed_sandbox_authorization_details: HashSet<acp_v1::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v1::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -1015,6 +1030,11 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            expanded_activity_groups: HashSet::default(),
+            composer_in_list: false,
+            applied_thread_layout: AgentSettings::get_global(cx).thread_layout,
+            transcript_editor: None,
+            pending_rewrite: None,
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -1059,6 +1079,7 @@ impl ThreadView {
         this.sync_reported_activity(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
+        this.sync_transcript_editor(None, window, cx);
         this.sync_existing_elicitation_states(window, cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
@@ -1079,6 +1100,10 @@ impl ThreadView {
                             });
                         }
                         this.schedule_save(cx);
+                        // The message rail highlights the message being read.
+                        if this.applied_thread_layout == AgentThreadLayout::Document {
+                            cx.notify();
+                        }
                     });
                 });
             });
@@ -1134,10 +1159,23 @@ impl ThreadView {
         }
 
         match event {
-            MessageEditorEvent::Send => self.send(window, cx),
+            MessageEditorEvent::Send => {
+                self.send(window, cx);
+                if AgentSettings::get_global(cx).cursor_after_send == CursorAfterSend::Response
+                    && let Some(transcript_editor) = self.transcript_editor.clone()
+                {
+                    transcript_editor.update(cx, |transcript_editor, _| {
+                        transcript_editor.move_caret_to_next_response()
+                    });
+                }
+            }
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
             MessageEditorEvent::Cancel => {
-                if !self.close_thread_search(window, cx) {
+                if self.pending_rewrite.take().is_some() {
+                    self.message_editor
+                        .update(cx, |message_editor, cx| message_editor.clear(window, cx));
+                    cx.notify();
+                } else if !self.close_thread_search(window, cx) {
                     self.cancel_generation(cx);
                 }
             }
@@ -1150,7 +1188,18 @@ impl ThreadView {
                 self.run_local_command(*command, window, cx);
             }
             MessageEditorEvent::InputAttempted { .. } => {}
-            MessageEditorEvent::Edited => {}
+            MessageEditorEvent::Edited => {
+                // The focused composer stays rendered off screen, so typing after scrolling up
+                // would otherwise edit text the user cannot see.
+                if self.composer_in_list && !self.list_state.is_following_tail() {
+                    self.scroll_to_end(cx);
+                }
+                if let Some(transcript_editor) = self.transcript_editor.clone() {
+                    transcript_editor.update(cx, |transcript_editor, cx| {
+                        transcript_editor.scroll_to_composer(window, cx)
+                    });
+                }
+            }
         }
     }
 
@@ -1745,7 +1794,19 @@ impl ThreadView {
 
         let message_editor = self.message_editor.clone();
 
-        let is_editor_empty = message_editor.read(cx).is_empty(cx);
+        let has_draft_comments = self
+            .transcript_editor
+            .as_ref()
+            .is_some_and(|transcript_editor| transcript_editor.read(cx).has_draft_comments());
+        // Comments alone are worth sending.
+        let is_editor_empty = message_editor.read(cx).is_empty(cx) && !has_draft_comments;
+        if let Some(entry_ix) = self.pending_rewrite.take()
+            && !is_editor_empty
+        {
+            self.regenerate(entry_ix, message_editor, window, cx);
+            cx.notify();
+            return;
+        }
         let is_generating = thread.read(cx).status() != ThreadStatus::Idle;
 
         if is_editor_empty {
@@ -1879,6 +1940,14 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let contents = self.resolve_message_contents(&message_editor, cx);
+        let draft_comments = self
+            .transcript_editor
+            .clone()
+            .and_then(|transcript_editor| {
+                transcript_editor.update(cx, |transcript_editor, cx| {
+                    transcript_editor.take_draft_comments(cx)
+                })
+            });
 
         self.thread_error.take();
         self.thread_feedback.clear();
@@ -1896,7 +1965,10 @@ impl ThreadView {
         }
 
         let contents_task = cx.spawn_in(window, async move |_this, cx| {
-            let (contents, tracked_buffers) = contents.await?;
+            let (mut contents, tracked_buffers) = contents.await?;
+            if let Some(draft_comments) = draft_comments {
+                contents.push(draft_comments.into());
+            }
 
             if contents.is_empty() {
                 return Ok(None);
@@ -2656,15 +2728,70 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.message_editor.read(cx).is_empty(cx) {
-            cx.propagate();
+        if self.message_editor.read(cx).is_empty(cx)
+            && let Some(last_id) = self.message_queue.last_id()
+        {
+            self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
             return;
         }
-        let Some(last_id) = self.message_queue.last_id() else {
-            cx.propagate();
+        // The composer passes `MoveUp` on only when its caret is already at the start.
+        if let Some(transcript_editor) = self.transcript_editor.clone() {
+            transcript_editor.update(cx, |transcript_editor, cx| {
+                transcript_editor.focus_end(window, cx)
+            });
             return;
-        };
-        self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
+        }
+        cx.propagate();
+    }
+
+    /// The caret's horizontal position, when it sits on the composer's first line.
+    fn composer_caret_x_on_first_line(&self, window: &mut Window, cx: &mut App) -> Option<Pixels> {
+        let editor = self.message_editor.read(cx).editor().clone();
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let selection = editor.selections.newest_display(&snapshot);
+            if !selection.is_empty() || selection.head().row().0 != 0 {
+                return None;
+            }
+            let details = editor.text_layout_details(window, cx);
+            Some(snapshot.x_for_display_point(selection.head(), &details))
+        })
+    }
+
+    /// Moves focus to the composer's first line at a horizontal position, arriving from the
+    /// text above.
+    pub(super) fn focus_composer_at_x(
+        &mut self,
+        x: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_composer(None, window, cx);
+        let editor = self.message_editor.read(cx).editor().clone();
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let details = editor.text_layout_details(window, cx);
+            let column = snapshot.display_column_for_x(DisplayRow(0), x, &details);
+            let point = DisplayPoint::new(DisplayRow(0), column);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_display_ranges([point..point])
+            });
+        });
+    }
+
+    /// Moves focus from the transcript editor to the composer, carrying typed text along.
+    pub(super) fn focus_composer(
+        &mut self,
+        text: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.message_editor.update(cx, |message_editor, cx| {
+            window.focus(&message_editor.focus_handle(cx), cx);
+            if let Some(text) = text {
+                message_editor.insert_text(text, window, cx);
+            }
+        });
     }
 
     // editor methods
@@ -4588,6 +4715,27 @@ impl ThreadView {
             return div().into_any_element();
         }
 
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+
+        if self.composer_in_list || self.transcript_editor.is_some() {
+            return h_flex()
+                .py_1()
+                .justify_center()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    div()
+                        .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
+                        .when(max_content_width.is_none(), |this| this.w_full())
+                        .min_w_0()
+                        .px_2()
+                        .flex_shrink_1()
+                        .flex_grow_0()
+                        .child(self.render_composer_controls(cx)),
+                )
+                .into_any();
+        }
+
         let focus_handle = self.message_editor.focus_handle(cx);
         let editor_bg_color = cx.theme().colors().editor_background;
 
@@ -4598,7 +4746,6 @@ impl ThreadView {
             (IconName::Maximize, "Expand Message Editor")
         };
 
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.list_state.item_count() > 0;
         let fills_container = !has_messages || editor_expanded;
 
@@ -4670,41 +4817,43 @@ impl ThreadView {
                                 )
                             }),
                     )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .flex_none()
-                            .flex_wrap()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .flex_wrap()
-                                    .gap_0p5()
-                                    .child(self.render_add_context_button(cx))
-                                    .child(self.render_follow_toggle(cx))
-                                    .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
-                            )
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .flex_wrap()
-                                    .gap_1()
-                                    .children(self.render_token_usage(cx))
-                                    .children(self.profile_selector.clone())
-                                    .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this.child(config_view),
-                                        None => this
-                                            .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
-                                    })
-                                    .child(self.render_send_button(cx)),
-                            ),
-                    ),
+                    .child(self.render_composer_controls(cx)),
             )
             .into_any()
+    }
+
+    fn render_composer_controls(&mut self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .flex_wrap()
+            .justify_between()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_0p5()
+                    .child(self.render_add_context_button(cx))
+                    .child(self.render_follow_toggle(cx))
+                    .children(self.render_fast_mode_control(cx))
+                    .children(self.render_thinking_control(cx)),
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(self.render_token_usage(cx))
+                    .children(self.profile_selector.clone())
+                    .map(|this| match self.config_options_view.clone() {
+                        Some(config_view) => this.child(config_view),
+                        None => this
+                            .children(self.mode_selector.clone())
+                            .children(self.model_selector.clone()),
+                    })
+                    .child(self.render_send_button(cx)),
+            )
     }
 
     fn render_queue_steer_button(
@@ -6358,11 +6507,13 @@ impl ThreadView {
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
-                } else if this.generating_indicator_in_list {
+                } else if this.generating_indicator_in_list && index == entries.len() {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
                         || this.has_pending_request_elicitation(cx);
                     let rendered = this.render_generating(confirmation, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
+                } else if this.composer_in_list {
+                    centered_container(this.render_list_composer(cx)).into_any_element()
                 } else {
                     Empty.into_any()
                 }
@@ -6370,6 +6521,137 @@ impl ThreadView {
         )
         .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
         .flex_grow_1()
+    }
+
+    /// The avatar beside a user message in the transcript editor. It opens the message's
+    /// actions, which would otherwise crowd the prose.
+    pub(super) fn render_transcript_user_mark(
+        &self,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let entries = self.thread.read(cx).entries();
+        let Some(AgentThreadEntry::UserMessage(message)) = entries.get(entry_ix) else {
+            return Empty.into_any();
+        };
+        let can_edit = self.can_edit_user_message(entry_ix, cx);
+        let restorable_client_id = message
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.show)
+            .then(|| message.client_id.clone())
+            .flatten()
+            .filter(|_| self.thread.read(cx).supports_truncate(cx));
+        let weak_self = cx.entity().downgrade();
+
+        PopoverMenu::new(("transcript-user-mark", entry_ix))
+            .trigger(
+                ButtonLike::new(("transcript-user-mark-trigger", entry_ix))
+                    .style(ButtonStyle::Transparent)
+                    .child(self.render_user_avatar(cx)),
+            )
+            .menu(move |window, cx| {
+                let weak_self = weak_self.clone();
+                let restorable_client_id = restorable_client_id.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.when(can_edit, |menu| {
+                        let weak_self = weak_self.clone();
+                        menu.entry("Edit Message", None, move |window, cx| {
+                            weak_self
+                                .update(cx, |this, cx| {
+                                    this.start_transcript_rewrite(entry_ix, window, cx)
+                                })
+                                .log_err();
+                        })
+                    })
+                    .when_some(restorable_client_id, |menu, client_id| {
+                        let weak_self = weak_self.clone();
+                        menu.entry("Restore Checkpoint", None, move |_window, cx| {
+                            weak_self
+                                .update(cx, |this, cx| this.restore_checkpoint(&client_id, cx))
+                                .log_err();
+                        })
+                    })
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// The agent's icon beside the start of each reply in the transcript editor.
+    pub(super) fn render_transcript_agent_mark(&self) -> AnyElement {
+        match self.agent_icon_from_external_svg.clone() {
+            Some(svg) => Icon::from_external_svg(svg),
+            None => Icon::new(self.agent_icon),
+        }
+        .size(IconSize::Small)
+        .color(Color::Muted)
+        .into_any_element()
+    }
+
+    /// Copy and feedback controls below the last prose of a finished turn.
+    pub(super) fn render_transcript_turn_controls(
+        &self,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let thread = self.thread.clone();
+        let entries = thread.read(cx).entries();
+        let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
+        let is_turn_end =
+            Self::entry_is_finalized_turn_end(entries, entry_ix).unwrap_or(!is_generating);
+        if !is_turn_end {
+            return None;
+        }
+        let user_message_index = entries
+            .iter()
+            .take(entry_ix)
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
+        Some(
+            self.render_thread_controls(
+                &thread,
+                entry_ix,
+                Some(entry_ix),
+                entry_ix + 1 == entries.len(),
+                user_message_index,
+                cx,
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Loads a user message into the composer; sending it rewinds the thread to it.
+    fn start_transcript_rewrite(
+        &mut self,
+        entry_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AgentThreadEntry::UserMessage(message)) =
+            self.thread.read(cx).entries().get(entry_ix)
+        else {
+            return;
+        };
+        let source_blocks = message.content.source_blocks().to_vec();
+        self.pending_rewrite = Some(entry_ix);
+        self.message_editor.update(cx, |message_editor, cx| {
+            message_editor.set_source_message(source_blocks, window, cx);
+            window.focus(&message_editor.focus_handle(cx), cx);
+        });
+        cx.notify();
+    }
+
+    /// Renders one entry as it appears in the chat layout, for the transcript editor's cards.
+    pub(super) fn render_transcript_card(
+        &self,
+        entry_ix: usize,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let entries = self.thread.read(cx).entries();
+        match entries.get(entry_ix) {
+            Some(entry) => self.render_entry(entry_ix, entries.len(), entry, window, cx),
+            None => Empty.into_any(),
+        }
     }
 
     fn render_entry(
@@ -6391,7 +6673,18 @@ impl ThreadView {
 
         let mut assistant_message_is_blank = false;
 
+        let document_layout =
+            AgentSettings::get_global(cx).thread_layout == AgentThreadLayout::Document;
+        let activity_group = self.activity_group(entry_ix, cx);
+        let collapsed_activity_group = activity_group.as_ref().filter(|group| !group.expanded);
+
         let primary = match &entry {
+            _ if collapsed_activity_group.is_some_and(|group| group.range.start != entry_ix) => {
+                Empty.into_any()
+            }
+            _ if let Some(group) = collapsed_activity_group => {
+                self.render_activity_group_header(group, cx)
+            }
             AgentThreadEntry::UserMessage(message) => {
                 let Some(editor) = self
                     .entry_view_state
@@ -6430,6 +6723,7 @@ impl ThreadView {
                 } else {
                     self.agent_id.clone()
                 };
+                let avatar = document_layout.then(|| self.render_user_avatar(cx));
 
                 v_flex()
                     .id(("user_message", entry_ix))
@@ -6442,6 +6736,9 @@ impl ThreadView {
                     })
                     .pb_3()
                     .px_2()
+                    // The avatar sits in a gutter so the message text lines up with the
+                    // assistant prose, which is inset by `px_5`.
+                    .when(document_layout, |this| this.pl_0())
                     .gap_1p5()
                     .w_full()
                     .when(can_restore_checkpoint && has_checkpoint_button, |this| {
@@ -6466,6 +6763,10 @@ impl ThreadView {
                     .child(
                         div()
                             .relative()
+                            .when_some(avatar, |this, avatar| {
+                                this.pl(rems_from_px(15_f32))
+                                    .child(div().absolute().left_0p5().top_2().child(avatar))
+                            })
                             .child(
                                 div()
                                     .py_3()
@@ -6496,6 +6797,16 @@ impl ThreadView {
                                             .hover(|s| {
                                                 s.border_color(focus_border.opacity(0.8))
                                             })
+                                    })
+                                    .when(document_layout, |this| {
+                                        let this = this.py_1().pl_0().pr_1();
+                                        if editing && editor_focus {
+                                            this
+                                        } else {
+                                            this.bg(gpui::transparent_black())
+                                                .border_color(gpui::transparent_black())
+                                                .shadow_none()
+                                        }
                                     })
                                     .text_xs()
                                     .child(editor.clone().into_any_element())
@@ -6721,6 +7032,15 @@ impl ThreadView {
             }
         };
 
+        let primary = match &activity_group {
+            Some(group) if group.expanded && group.range.start == entry_ix => v_flex()
+                .w_full()
+                .child(self.render_activity_group_header(group, cx))
+                .child(primary)
+                .into_any_element(),
+            _ => primary,
+        };
+
         let is_subagent_output = self.is_subagent()
             && matches!(entry, AgentThreadEntry::AssistantMessage(msg) if msg.is_subagent_output);
 
@@ -6870,6 +7190,285 @@ impl ThreadView {
         } else {
             primary
         }
+    }
+
+    pub(super) fn render_user_avatar(&self, cx: &App) -> AnyElement {
+        let project = self.thread.read(cx).project().read(cx);
+        match project.user_store().read(cx).current_user() {
+            Some(user) => Avatar::new(user.avatar_uri.clone())
+                .size(rems_from_px(14_f32))
+                .into_any_element(),
+            None => Icon::new(IconName::Person)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        }
+    }
+
+    /// Markers on the right edge of the document layout, one per user message. Clicking a
+    /// marker jumps to that message; the marker of the message being read is highlighted.
+    fn render_message_rail(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
+        let has_rail = matches!(
+            self.applied_thread_layout,
+            AgentThreadLayout::Document | AgentThreadLayout::Editor
+        );
+        if !has_rail || self.is_subagent() {
+            return None;
+        }
+        let entries = self.thread.read(cx).entries();
+        let user_messages: Vec<(usize, &acp_thread::UserMessage)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| match entry {
+                AgentThreadEntry::UserMessage(message) => Some((entry_ix, message)),
+                _ => None,
+            })
+            .collect();
+        // With one message there is nothing to navigate between.
+        if user_messages.len() < 2 {
+            return None;
+        }
+
+        let transcript_editor = self.transcript_editor.clone();
+        let scroll_top_ix = match &transcript_editor {
+            Some(transcript_editor) => transcript_editor.read(cx).top_entry_ix(),
+            None => self.list_state.logical_scroll_top().item_ix,
+        };
+        let active_position = user_messages
+            .iter()
+            .rposition(|(entry_ix, _)| *entry_ix <= scroll_top_ix)
+            .unwrap_or(0);
+
+        const MARKER_SLOT_HEIGHT: f32 = 8.;
+        let rail_height = match &transcript_editor {
+            // The window height is an upper bound; the rail is centered either way.
+            Some(_) => window.viewport_size().height,
+            None => self.list_state.viewport_bounds().size.height,
+        };
+        let max_markers = ((rail_height / px(MARKER_SLOT_HEIGHT)).floor() as usize).max(1);
+        // Long threads show the run of markers around the message being read.
+        let first_shown = active_position
+            .saturating_sub(max_markers / 2)
+            .min(user_messages.len().saturating_sub(max_markers));
+
+        let markers = user_messages
+            .iter()
+            .enumerate()
+            .skip(first_shown)
+            .take(max_markers)
+            .map(|(position, (entry_ix, message))| {
+                let entry_ix = *entry_ix;
+                let is_active = position == active_position;
+                let markdown = message.content.to_markdown(cx);
+                let first_line = markdown
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or_default();
+                let preview: String = if first_line.chars().count() > 80 {
+                    first_line.chars().take(79).chain(['…']).collect()
+                } else {
+                    first_line.to_string()
+                };
+                let color = if is_active {
+                    cx.theme().colors().text
+                } else {
+                    cx.theme().colors().text_muted.opacity(0.5)
+                };
+
+                div()
+                    .id(("message-rail-marker", entry_ix))
+                    .h(px(MARKER_SLOT_HEIGHT))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(div().w(px(10.)).h(px(2.)).rounded_xs().bg(color))
+                    .tooltip(Tooltip::text(preview))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        match this.transcript_editor.clone() {
+                            Some(transcript_editor) => {
+                                transcript_editor.update(cx, |transcript_editor, cx| {
+                                    transcript_editor.scroll_to_entry(entry_ix, window, cx)
+                                });
+                            }
+                            None => {
+                                this.list_state.scroll_to(ListOffset {
+                                    item_ix: entry_ix,
+                                    offset_in_item: px(0.),
+                                });
+                            }
+                        }
+                        cx.notify();
+                    }))
+            });
+
+        Some(
+            v_flex()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                // Keeps the markers inside the transcript's right padding, clear of the text.
+                .right(px(1.))
+                .justify_center()
+                .children(markers)
+                .into_any_element(),
+        )
+    }
+
+    /// The message editor as the last item of the transcript. The nesting mirrors a user
+    /// message in the document layout so the caret lines up with the sent messages above.
+    fn render_list_composer(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .pt_2()
+            .pb_4()
+            .pr_2()
+            .w_full()
+            .on_action(cx.listener(Self::handle_message_editor_move_up))
+            .child(
+                div()
+                    .relative()
+                    .pl(rems_from_px(15_f32))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0p5()
+                            .top_2()
+                            .child(self.render_user_avatar(cx)),
+                    )
+                    .child(
+                        div()
+                            .py_1()
+                            .pr_1()
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .text_xs()
+                            .child(self.message_editor.clone()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The run of consecutive activity entries around `entry_ix`, when the document
+    /// layout folds it into one summary line.
+    fn activity_group(&self, entry_ix: usize, cx: &App) -> Option<ActivityGroup> {
+        if AgentSettings::get_global(cx).thread_layout != AgentThreadLayout::Document {
+            return None;
+        }
+        let entries = self.thread.read(cx).entries();
+        ActivityKind::of(entries.get(entry_ix)?, cx)?;
+
+        let start = entries[..entry_ix]
+            .iter()
+            .rposition(|entry| ActivityKind::of(entry, cx).is_none())
+            .map_or(0, |ix| ix + 1);
+        let end = entries[entry_ix + 1..]
+            .iter()
+            .position(|entry| ActivityKind::of(entry, cx).is_none())
+            .map_or(entries.len(), |offset| entry_ix + 1 + offset);
+
+        // A single action reads fine on its own; folding it would only add a click.
+        if end - start < 2 {
+            return None;
+        }
+        // Thoughts merge into one assistant message, so a run of two or more entries
+        // always holds a tool call.
+        let key = entries[start..end].iter().find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call) => Some(tool_call.id.clone()),
+            _ => None,
+        })?;
+        Some(ActivityGroup {
+            expanded: self.expanded_activity_groups.contains(&key),
+            range: start..end,
+            key,
+        })
+    }
+
+    /// Expands the activity group that hides `entry_ix`, if any.
+    fn reveal_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        if let Some(group) = self.activity_group(entry_ix, cx)
+            && !group.expanded
+        {
+            self.expanded_activity_groups.insert(group.key);
+            self.list_state.remeasure_items(group.range);
+        }
+    }
+
+    fn render_activity_group_header(
+        &self,
+        group: &ActivityGroup,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let entries = self.thread.read(cx).entries();
+        let group_entries = entries.get(group.range.clone()).unwrap_or_default();
+        let is_running = group_entries.iter().any(|entry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ToolCall(tool_call) if matches!(
+                    tool_call.status(),
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                )
+            )
+        });
+        let summary = activity_summary(
+            group_entries
+                .iter()
+                .filter_map(|entry| ActivityKind::of(entry, cx)),
+        );
+
+        let range = group.range.clone();
+        let key = group.key.clone();
+        let chevron = if group.expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+
+        h_flex()
+            .id(("activity-group", group.range.start))
+            .px_5()
+            .py_1()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                Label::new(summary)
+                    .size(LabelSize::Custom(self.tool_name_font_size()))
+                    .color(Color::Muted),
+            )
+            .when(is_running, |this| {
+                this.child(
+                    SpinnerLabel::new()
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                Icon::new(chevron)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.toggle_activity_group(key.clone(), range.clone(), cx);
+            }))
+            .into_any_element()
+    }
+
+    fn toggle_activity_group(
+        &mut self,
+        key: acp_v1::ToolCallId,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.expanded_activity_groups.remove(&key) {
+            self.expanded_activity_groups.insert(key);
+            // Expanding while following the tail would scroll the summary the user just
+            // clicked out of view.
+            if self.list_state.is_following_tail() {
+                self.list_state.pause_following_tail();
+            }
+        }
+        self.list_state.remeasure_items(range);
+        cx.notify();
     }
 
     fn render_elicitation(
@@ -7446,6 +8045,12 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(transcript_editor) = self.transcript_editor.clone() {
+            transcript_editor.update(cx, |transcript_editor, cx| {
+                transcript_editor.toggle_search(window, cx)
+            });
+            return;
+        }
         if self.thread_search_bar.is_none() {
             let thread = self.thread.clone();
             let view = cx.entity().downgrade();
@@ -7456,6 +8061,7 @@ impl ThreadView {
                     let view = view.clone();
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
+                            this.reveal_entry(entry_ix, cx);
                             this.list_state.scroll_to(gpui::ListOffset {
                                 item_ix: entry_ix,
                                 offset_in_item: gpui::px(0.),
@@ -7527,14 +8133,23 @@ impl ThreadView {
     }
 
     pub(crate) fn sync_editor_mode(&mut self, cx: &mut Context<Self>) {
+        self.sync_composer_in_list(cx);
+
         let has_messages = self.list_state.item_count() > 0;
         let v2_empty_state = !has_messages;
+        let composer_in_document = self.composer_in_list || self.composer_in_transcript(cx);
 
-        if !has_messages {
+        if !has_messages || composer_in_document {
             self.editor_expanded = false;
         }
 
-        let mode = if self.editor_expanded {
+        let mode = if composer_in_document {
+            // The composer grows with the document, so the list scrolls instead of the editor.
+            EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines: None,
+            }
+        } else if self.editor_expanded {
             EditorMode::Full {
                 scale_ui_elements_with_buffer_font_size: false,
                 show_active_line_background: false,
@@ -7555,6 +8170,161 @@ impl ThreadView {
         self.message_editor.update(cx, |editor, cx| {
             editor.set_mode(mode, cx);
         });
+    }
+
+    /// In the editor layout the message editor is the last block of the transcript editor.
+    fn composer_in_transcript(&self, cx: &App) -> bool {
+        !self.is_subagent()
+            && self.applied_thread_layout == AgentThreadLayout::Editor
+            && !self.thread.read(cx).entries().is_empty()
+    }
+
+    /// The composer as the transcript editor shows it, below the last message.
+    pub(super) fn render_transcript_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Lets key bindings (vim motions) hand off to the text above from the first line.
+        let mut key_context = gpui::KeyContext::new_with_defaults();
+        key_context.add("AgentTranscriptComposer");
+        let composer = self.message_editor.read(cx).editor().clone();
+        let on_first_line = composer.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest_display(&snapshot).head().row().0 == 0
+        });
+        if on_first_line {
+            key_context.add("first_line");
+        }
+        // No top padding: the avatar in the gutter lines up with the composer's first line.
+        v_flex()
+            .key_context(key_context)
+            .w_full()
+            .pb_2()
+            .gap_1()
+            .on_action(cx.listener(
+                |this, action: &crate::ContinueInTranscript, window, cx| {
+                    let Some(transcript_editor) = this.transcript_editor.clone() else {
+                        return;
+                    };
+                    match this.composer_caret_x_on_first_line(window, cx) {
+                        Some(x) => transcript_editor.update(cx, |transcript_editor, cx| {
+                            transcript_editor.focus_last_text_line_at(x, window, cx)
+                        }),
+                        None => transcript_editor.update(cx, |transcript_editor, cx| {
+                            transcript_editor.focus_end(window, cx)
+                        }),
+                    }
+                    if let Some(name) = &action.action {
+                        let focus_handle = transcript_editor.read(cx).focus_handle(cx);
+                        crate::dispatch_named_action(name, &focus_handle, window, cx);
+                    }
+                },
+            ))
+            // Runs before the composer's own `MoveUp`, which would first go to the start of the
+            // line: from anywhere on its first line, the caret goes straight up into the text.
+            .capture_action(cx.listener(|this, _: &zed_actions::editor::MoveUp, window, cx| {
+                let queue_takes_it = this.message_editor.read(cx).is_empty(cx)
+                    && this.message_queue.last_id().is_some();
+                if queue_takes_it {
+                    return;
+                }
+                let (Some(transcript_editor), Some(x)) = (
+                    this.transcript_editor.clone(),
+                    this.composer_caret_x_on_first_line(window, cx),
+                ) else {
+                    return;
+                };
+                transcript_editor.update(cx, |transcript_editor, cx| {
+                    transcript_editor.focus_last_text_line_at(x, window, cx)
+                });
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(Self::handle_message_editor_move_up))
+            // The composer passes `MoveDown` on from its last line; there is nothing below.
+            .on_action(|_: &zed_actions::editor::MoveDown, _window, _cx| {})
+            .child(self.message_editor.clone())
+            .when(self.pending_rewrite.is_some(), |this| {
+                this.child(
+                    Label::new(
+                        "Editing an earlier message. Sending restarts the thread from it; Esc cancels.",
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// In the document layout the message editor is the last list item, so the user writes
+    /// at the end of the transcript. It stays after the generating indicator, and new entries
+    /// are spliced in before both.
+    fn sync_composer_in_list(&mut self, cx: &App) {
+        let belongs_in_list = !self.is_subagent()
+            && AgentSettings::get_global(cx).thread_layout == AgentThreadLayout::Document
+            && !self.thread.read(cx).entries().is_empty();
+        if belongs_in_list == self.composer_in_list {
+            return;
+        }
+        let item_count = self.list_state.item_count();
+        if belongs_in_list {
+            // Registering the focus handle keeps the editor rendered while it has focus, even
+            // when it is scrolled out of view.
+            self.list_state.splice_focusable(
+                item_count..item_count,
+                [Some(self.message_editor.focus_handle(cx))],
+            );
+        } else {
+            self.list_state
+                .splice(item_count.saturating_sub(1)..item_count, 0);
+        }
+        self.composer_in_list = belongs_in_list;
+    }
+
+    /// Re-applies the thread layout after a settings change. Every item may change height.
+    pub(crate) fn thread_layout_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread_layout = AgentSettings::get_global(cx).thread_layout;
+        if thread_layout == self.applied_thread_layout {
+            return;
+        }
+        self.applied_thread_layout = thread_layout;
+        self.sync_editor_mode(cx);
+        self.sync_transcript_editor(None, window, cx);
+        self.list_state.remeasure();
+        cx.notify();
+    }
+
+    /// Creates, updates, or drops the transcript editor to match the layout and entries.
+    pub(crate) fn sync_transcript_editor(
+        &mut self,
+        changed_entry: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let wanted = !self.is_subagent()
+            && self.applied_thread_layout == AgentThreadLayout::Editor
+            && !self.thread.read(cx).entries().is_empty();
+        if !wanted {
+            self.transcript_editor = None;
+            return;
+        }
+        match &self.transcript_editor {
+            Some(transcript_editor) => {
+                transcript_editor.update(cx, |transcript_editor, cx| {
+                    transcript_editor.sync(changed_entry, window, cx)
+                });
+            }
+            None => {
+                let thread = self.thread.clone();
+                let thread_view = cx.entity().downgrade();
+                let root_thread_id = self.root_thread_id;
+                self.transcript_editor = Some(cx.new(|cx| {
+                    super::transcript_editor::TranscriptEditor::new(
+                        thread,
+                        thread_view,
+                        root_thread_id,
+                        window,
+                        cx,
+                    )
+                }));
+            }
+        }
     }
 
     /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
@@ -7953,6 +8723,250 @@ impl ThreadView {
                 })
             })
             .into_any_element()
+    }
+
+    /// Starts a thread from a comment on a passage. It begins with this conversation, the
+    /// passage, and the comment, and the sidebar nests it under this thread.
+    pub(super) fn start_subthread(
+        &mut self,
+        quote: String,
+        comment: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
+        else {
+            self.handle_thread_error(anyhow!("Could not start a thread: no agent panel."), cx);
+            return;
+        };
+        let thread = self.thread.read(cx);
+        let parent_title = thread
+            .title()
+            .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into())
+            .to_string();
+        let parent_uri = MentionUri::Thread {
+            id: thread.session_id().clone(),
+            name: parent_title,
+        }
+        .to_uri()
+        .to_string();
+        let quoted = quote
+            .lines()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blocks = vec![
+            // The parent conversation goes along as text, so every agent has the context.
+            acp_v1::ContentBlock::Resource(acp_v1::EmbeddedResource::new(
+                acp_v1::EmbeddedResourceResource::TextResourceContents(
+                    acp_v1::TextResourceContents::new(thread.to_markdown(cx), parent_uri),
+                ),
+            )),
+            // The comment comes first: agents derive the thread title from the opening line.
+            acp_v1::ContentBlock::from(format!(
+                "{comment}\n\nThis follows up a comment on this passage of the conversation \
+                 above:\n\n{quoted}"
+            )),
+        ];
+        let title: String = comment.chars().take(60).collect();
+        let options = crate::agent_panel::CreateThreadOptions {
+            title: Some(title.into()),
+            initial_content: Some(AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: true,
+            }),
+            agent: Some(crate::Agent::from(self.agent_id.clone())),
+            model: None,
+            work_dirs: None,
+        };
+        let parent_thread_id = self.root_thread_id;
+        let thread_id = panel.update(cx, |panel, cx| {
+            panel.create_thread_with_options(
+                options,
+                crate::AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_parent(
+                thread_id,
+                crate::thread_metadata_store::ThreadParent {
+                    parent_thread_id,
+                    quote,
+                },
+                cx,
+            )
+        });
+    }
+
+    pub(super) fn open_subthread(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
+        else {
+            return;
+        };
+        let Some(metadata) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned()
+        else {
+            self.show_local_command_toast("That thread no longer exists", cx);
+            return;
+        };
+        // Opening replaces this thread in the panel, which reads this view; let the current
+        // update finish first.
+        window.defer(cx, move |window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.load_agent_thread(
+                    crate::Agent::from(metadata.agent_id.clone()),
+                    thread_id,
+                    None,
+                    metadata.title(),
+                    true,
+                    crate::AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+    }
+
+    /// What a subthread is doing, when it is open in the agent panel.
+    pub(super) fn subthread_status(&self, thread_id: ThreadId, cx: &App) -> Option<&'static str> {
+        let panel = self
+            .workspace
+            .upgrade()?
+            .read(cx)
+            .panel::<crate::AgentPanel>(cx)?;
+        let conversation_view = panel
+            .read(cx)
+            .conversation_views()
+            .into_iter()
+            .find(|view| view.read(cx).parent_id() == thread_id)?;
+        let conversation_view = conversation_view.read(cx);
+        if conversation_view.root_thread_has_pending_tool_call(cx) {
+            return Some("Waiting for you");
+        }
+        let thread_view = conversation_view.root_thread_view()?;
+        let thread = thread_view.read(cx).thread.read(cx);
+        Some(if thread.had_error() {
+            "Error"
+        } else {
+            match thread.status() {
+                ThreadStatus::Generating => "Running",
+                ThreadStatus::Idle => "Done",
+            }
+        })
+    }
+
+    /// The thread entry under the transcript editor's caret, in the editor layout.
+    fn caret_entry_ix(&self, cx: &App) -> Option<usize> {
+        self.transcript_editor
+            .as_ref()
+            .and_then(|transcript_editor| transcript_editor.read(cx).caret_entry_ix(cx))
+    }
+
+    fn revert_conversation_to_cursor(
+        &mut self,
+        _: &RevertConversationToCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(caret_entry_ix) = self.caret_entry_ix(cx) else {
+            cx.propagate();
+            return;
+        };
+        let thread = self.thread.read(cx);
+        if !thread.supports_truncate(cx) {
+            self.handle_thread_error(
+                anyhow!("This agent does not support reverting the conversation."),
+                cx,
+            );
+            return;
+        }
+        let entries = thread.entries();
+        // The turn under the cursor stays; the first user message after it is the revert
+        // point. A cursor inside a user message reverts to just before that message.
+        let target = (caret_entry_ix..entries.len()).find(|&entry_ix| {
+            matches!(
+                entries.get(entry_ix),
+                Some(AgentThreadEntry::UserMessage(_))
+            )
+        });
+        let Some(client_id) =
+            target.and_then(|entry_ix| entries.get(entry_ix)?.user_message()?.client_id.clone())
+        else {
+            self.show_local_command_toast("Nothing after the cursor to revert", cx);
+            return;
+        };
+
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Revert the conversation to the cursor?",
+            Some(
+                "Messages after the cursor are removed, and project files return to how they were at that point.",
+            ),
+            &["Revert", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await? == 0 {
+                this.update(cx, |this, cx| this.restore_checkpoint(&client_id, cx))?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn copy_agent_response(
+        &mut self,
+        _: &CopyAgentResponse,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.thread.read(cx).entries();
+        let entry_ix = match self.caret_entry_ix(cx) {
+            // On a user message, the response is the one that follows it.
+            Some(entry_ix)
+                if matches!(
+                    entries.get(entry_ix),
+                    Some(AgentThreadEntry::UserMessage(_))
+                ) =>
+            {
+                entry_ix + 1
+            }
+            Some(entry_ix) => entry_ix,
+            None => entries.len().saturating_sub(1),
+        };
+        match Self::get_agent_message_content(entries, entry_ix, cx) {
+            Some(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.show_local_command_toast("Copied the agent response", cx);
+            }
+            None => self.show_local_command_toast("No agent response at the cursor", cx),
+        }
+    }
+
+    fn copy_thread_as_markdown(
+        &mut self,
+        _: &CopyThreadAsMarkdown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let markdown = self.thread.read(cx).to_markdown(cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+        self.show_local_command_toast("Copied the thread as Markdown", cx);
     }
 
     fn get_agent_message_content(
@@ -12634,10 +13648,19 @@ impl Render for ThreadView {
                 this.child(Self::render_resume_notice(cx))
             })
             .map(|this| {
-                if has_messages {
+                if let Some(transcript_editor) = self.transcript_editor.clone() {
                     this.flex_1()
                         .size_full()
+                        .relative()
+                        .child(transcript_editor)
+                        .children(self.render_message_rail(window, cx))
+                        .into_any()
+                } else if has_messages {
+                    this.flex_1()
+                        .size_full()
+                        .relative()
                         .child(self.render_entries(cx))
+                        .children(self.render_message_rail(window, cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
                 } else {
@@ -12764,6 +13787,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(Self::revert_conversation_to_cursor))
+            .on_action(cx.listener(Self::copy_agent_response))
+            .on_action(cx.listener(Self::copy_thread_as_markdown))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
@@ -12982,6 +14008,123 @@ impl Render for ThreadView {
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
             .child(self.render_message_editor(window, cx))
+    }
+}
+
+/// One summary line for a run of activity, for example "Read 2 files, ran 1 command".
+pub(super) fn activity_summary(kinds: impl IntoIterator<Item = ActivityKind>) -> String {
+    let mut counts: Vec<(ActivityKind, usize)> = Vec::new();
+    for kind in kinds {
+        match counts.iter_mut().find(|(existing, _)| *existing == kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    let summary = counts
+        .into_iter()
+        .map(|(kind, count)| kind.describe(count))
+        .join(", ");
+    let mut characters = summary.chars();
+    characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default()
+}
+
+struct ActivityGroup {
+    range: Range<usize>,
+    key: acp_v1::ToolCallId,
+    expanded: bool,
+}
+
+/// Agent work that the document layout may fold into a summary line. File changes,
+/// permission prompts, failures, and subagents are never activity, so they stay visible.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActivityKind {
+    Read,
+    Search,
+    Command,
+    Fetch,
+    Thought,
+    Other,
+}
+
+impl ActivityKind {
+    pub(super) fn of(entry: &AgentThreadEntry, cx: &App) -> Option<Self> {
+        if entry.is_indented() {
+            return None;
+        }
+        match entry {
+            AgentThreadEntry::ToolCall(tool_call) => {
+                if tool_call.is_subagent()
+                    || !matches!(
+                        tool_call.status(),
+                        ToolCallStatus::Pending
+                            | ToolCallStatus::InProgress
+                            | ToolCallStatus::Completed
+                    )
+                    || tool_call.content().iter().any(|content| {
+                        matches!(
+                            content,
+                            ToolCallContent::Diff(_)
+                                | ToolCallContent::LegacyDiff { .. }
+                                | ToolCallContent::DiffPatch { .. }
+                        )
+                    })
+                {
+                    return None;
+                }
+                match tool_call.kind() {
+                    acp_v2::ToolKind::Edit | acp_v2::ToolKind::Delete | acp_v2::ToolKind::Move => {
+                        None
+                    }
+                    acp_v2::ToolKind::Read => Some(Self::Read),
+                    acp_v2::ToolKind::Search => Some(Self::Search),
+                    acp_v2::ToolKind::Execute => Some(Self::Command),
+                    acp_v2::ToolKind::Fetch => Some(Self::Fetch),
+                    acp_v2::ToolKind::Think => Some(Self::Thought),
+                    _ => Some(Self::Other),
+                }
+            }
+            AgentThreadEntry::AssistantMessage(message) => {
+                if message.is_subagent_output {
+                    return None;
+                }
+                let mut has_thought = false;
+                for chunk in &message.chunks {
+                    match chunk {
+                        AssistantMessageChunk::Message { block, .. } => {
+                            if block.visible_content(cx) {
+                                return None;
+                            }
+                        }
+                        AssistantMessageChunk::Thought { block, .. } => {
+                            has_thought |= block.visible_content(cx);
+                        }
+                    }
+                }
+                has_thought.then_some(Self::Thought)
+            }
+            AgentThreadEntry::UserMessage(_)
+            | AgentThreadEntry::Elicitation(_)
+            | AgentThreadEntry::ContextCompaction(_) => None,
+        }
+    }
+
+    pub(super) fn describe(self, count: usize) -> String {
+        let times = match count {
+            1 => "once".to_string(),
+            2 => "twice".to_string(),
+            _ => format!("{count} times"),
+        };
+        match self {
+            Self::Read => format!("read {count} {}", pluralize("file", count)),
+            Self::Search => format!("searched {times}"),
+            Self::Command => format!("ran {count} {}", pluralize("command", count)),
+            Self::Fetch => format!("fetched {count} {}", pluralize("page", count)),
+            Self::Thought => format!("thought {times}"),
+            Self::Other => format!("used {count} {}", pluralize("tool", count)),
+        }
     }
 }
 

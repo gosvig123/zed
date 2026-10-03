@@ -35,7 +35,9 @@ use gpui::{
 };
 use language::{Buffer, Language, Rope};
 use language_model::{
-    LanguageModelCompletionError, ProviderErrorCategory, ZED_CLOUD_PROVIDER_NAME,
+    CompletionIntent, LanguageModelCompletionError, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, MessageContent, ProviderErrorCategory, Role,
+    ZED_CLOUD_PROVIDER_NAME,
 };
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
@@ -94,14 +96,14 @@ use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
-    AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
-    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
-    OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
-    ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
-    ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
-    ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
-    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
-    ToggleThinkingMode, UndoLastReject,
+    AuthorizeToolCall, ClearMessageQueue, CopyAgentResponse, CopyThreadAsMarkdown,
+    CycleFavoriteModels, CycleModeSelector, CycleThinkingEffort, EditFirstQueuedMessage,
+    ExpandMessageEditor, Follow, KeepAll, NewThread, OpenAddContextMenu, OpenAgentDiff, RejectAll,
+    RejectOnce, RemoveFirstQueuedMessage, RevertConversationToCursor, ScrollOutputLineDown,
+    ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp, ScrollOutputToBottom,
+    ScrollOutputToNextMessage, ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately,
+    SendNextQueuedMessage, ToggleFastMode, ToggleProfileSelector, ToggleSteerFirstQueuedMessage,
+    ToggleThinkingEffortMenu, ToggleThinkingMode, UndoLastReject,
 };
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
@@ -113,6 +115,8 @@ pub(crate) mod elicitation;
 mod message_queue;
 mod thread_search_bar;
 mod thread_view;
+mod transcript_comments;
+mod transcript_editor;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -692,6 +696,10 @@ fn resolve_outcome_from_selection(
     Some(selected_choice.build_outcome(is_allow))
 }
 
+fn needs_generated_title(thread: &AcpThread) -> bool {
+    thread.title().is_none() || thread.has_provisional_title()
+}
+
 fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
     match event {
         AcpThreadEvent::NewEntry
@@ -749,6 +757,7 @@ pub struct ConversationView {
     /// causes mermaid diagrams to re-render).
     last_theme_id: Option<String>,
     draft_prompt_persist_task: Option<Task<()>>,
+    external_title_task: Option<Task<()>>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
@@ -959,6 +968,7 @@ impl ConversationView {
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
+            cx.observe_global_in::<SettingsStore>(window, Self::thread_layout_changed),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -1029,6 +1039,7 @@ impl ConversationView {
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
+            external_title_task: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
             _subscriptions: subscriptions,
@@ -1736,6 +1747,90 @@ impl ConversationView {
         matches!(self.server_state, ServerState::Loading { .. })
     }
 
+    /// Native threads get model-generated titles from `agent::Thread`, but external
+    /// agents get at most the first line of the first message as a provisional title,
+    /// and none when the agent opens the thread with its own message first. Replace
+    /// it once with a title from the thread summary model.
+    fn generate_external_thread_title(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.external_title_task.is_some()
+            || self.as_native_connection(cx).is_some()
+            || self.title_override(cx).is_some()
+            || !needs_generated_title(thread.read(cx))
+        {
+            return;
+        }
+        // Skip agent startup output such as Pi's skill and extension listing.
+        let conversation = thread
+            .read(cx)
+            .entries()
+            .iter()
+            .skip_while(|entry| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .collect::<Vec<_>>();
+        if !conversation
+            .iter()
+            .any(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
+        {
+            return;
+        }
+        let Some(model) = LanguageModelRegistry::read_global(cx).thread_summary_model(cx) else {
+            return;
+        };
+
+        let mut content = conversation
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    AgentThreadEntry::UserMessage(_) | AgentThreadEntry::AssistantMessage(_)
+                )
+            })
+            .take(6)
+            .map(|entry| util::truncate_and_trailoff(&entry.to_markdown(cx), 4000).into())
+            .collect::<Vec<MessageContent>>();
+        content.push(agent_settings::SUMMARIZE_THREAD_PROMPT.into());
+        let request = LanguageModelRequest {
+            thread_id: Some(thread.read(cx).session_id().to_string()),
+            intent: Some(CompletionIntent::ThreadSummarization),
+            temperature: AgentSettings::temperature_for_model(&model, cx),
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content,
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+
+        let thread = thread.downgrade();
+        self.external_title_task = Some(cx.spawn(async move |this, cx| {
+            let title = agent::stream_thread_title(model, request, cx).await;
+            let result = match title {
+                Ok(title) if !title.trim().is_empty() => thread.update(cx, |thread, cx| {
+                    // The agent or the user may have set a title while we waited.
+                    needs_generated_title(thread)
+                        .then(|| thread.set_title(title.trim().to_string().into(), cx))
+                }),
+                Ok(_) => Err(anyhow!("thread summary model returned an empty title")),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(Some(set_title)) => {
+                    set_title.await.log_err();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!("Failed to generate external agent thread title: {error:#}");
+                }
+            }
+            this.update(cx, |this, _cx| this.external_title_task = None)
+                .log_err();
+        }));
+    }
+
     fn handle_thread_event(
         &mut self,
         thread: &Entity<AcpThread>,
@@ -1793,6 +1888,7 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
+                        active.sync_transcript_editor(Some(index), window, cx);
                     });
                 }
             }
@@ -1814,6 +1910,7 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(*index, window, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
+                        active.sync_transcript_editor(Some(*index), window, cx);
                     });
                 }
             }
@@ -1825,6 +1922,7 @@ impl ConversationView {
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode(cx);
+                        active.sync_transcript_editor(None, window, cx);
                     });
                 }
             }
@@ -1885,6 +1983,7 @@ impl ConversationView {
                     }
                     return;
                 }
+                self.generate_external_thread_title(thread, cx);
 
                 if *stop_reason == Some(acp_v2::StopReason::MaxTokens)
                     && thread.read(cx).uses_reported_activity()
@@ -3377,6 +3476,17 @@ impl ConversationView {
             entry_view_state.update(cx, |entry_view_state, cx| {
                 entry_view_state.agent_ui_font_size_changed(cx);
             });
+        }
+    }
+
+    fn thread_layout_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(connected) = self.as_connected() {
+            let thread_views: Vec<_> = connected.threads.values().cloned().collect();
+            for thread_view in thread_views {
+                thread_view.update(cx, |thread_view, cx| {
+                    thread_view.thread_layout_changed(window, cx)
+                });
+            }
         }
     }
 

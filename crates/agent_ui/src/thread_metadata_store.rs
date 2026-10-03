@@ -497,9 +497,19 @@ pub struct ArchivedGitWorktree {
 /// The store holds all metadata needed to show threads in the sidebar/the archive.
 ///
 /// Listens to ConversationView events and updates metadata when the root thread changes.
+/// A thread started from a comment in another thread. The parent shows a reference at the
+/// quoted passage, and the sidebar nests the thread under its parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadParent {
+    pub parent_thread_id: ThreadId,
+    /// The passage of the parent the comment was on.
+    pub quote: String,
+}
+
 pub struct ThreadMetadataStore {
     db: ThreadMetadataDb,
     threads: HashMap<ThreadId, ThreadMetadata>,
+    parents: HashMap<ThreadId, ThreadParent>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
@@ -658,16 +668,33 @@ impl ThreadMetadataStore {
         let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task = cx.background_spawn(async move {
+            let rows = db.list().context("Failed to fetch sidebar metadata")?;
+            let parents = db
+                .list_parents()
+                .context("Failed to fetch thread parents")?;
+            anyhow::Ok((rows, parents))
+        });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
-                let Some(rows) = list_task.await.log_err() else {
+                let Some((rows, parents)) = list_task.await.log_err() else {
                     return;
                 };
 
                 this.update(cx, |this, cx| {
+                    this.parents = parents
+                        .into_iter()
+                        .map(|(thread_id, parent_thread_id, quote)| {
+                            (
+                                thread_id,
+                                ThreadParent {
+                                    parent_thread_id,
+                                    quote,
+                                },
+                            )
+                        })
+                        .collect();
                     this.threads.clear();
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
@@ -1137,7 +1164,40 @@ impl ThreadMetadataStore {
         }
     }
 
+    pub fn set_parent(
+        &mut self,
+        thread_id: ThreadId,
+        parent: ThreadParent,
+        cx: &mut Context<Self>,
+    ) {
+        self.parents.insert(thread_id, parent.clone());
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.save_parent(thread_id, parent).await })
+            .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    pub fn parent_of(&self, thread_id: ThreadId) -> Option<&ThreadParent> {
+        self.parents.get(&thread_id)
+    }
+
+    /// The threads started from comments in `parent_thread_id`, with their quoted passages.
+    pub fn children_of(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> impl Iterator<Item = (ThreadId, &ThreadParent)> {
+        self.parents
+            .iter()
+            .filter(move |(_, parent)| parent.parent_thread_id == parent_thread_id)
+            .map(|(thread_id, parent)| (*thread_id, parent))
+    }
+
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        if self.parents.remove(&thread_id).is_some() {
+            let db = self.db.clone();
+            cx.background_spawn(async move { db.delete_parent(thread_id).await })
+                .detach_and_log_err(cx);
+        }
         if let Some(thread) = self.threads.get(&thread_id) {
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
@@ -1238,6 +1298,7 @@ impl ThreadMetadataStore {
         let mut this = Self {
             db,
             threads: HashMap::default(),
+            parents: HashMap::default(),
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
@@ -1462,6 +1523,13 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS thread_parents(
+                thread_id BLOB PRIMARY KEY,
+                parent_thread_id BLOB NOT NULL,
+                quote TEXT NOT NULL
+            ) STRICT;
+        ),
     ];
 }
 
@@ -1570,6 +1638,43 @@ impl ThreadMetadataDb {
     }
 
     /// Delete metadata for a single thread.
+    pub fn list_parents(&self) -> anyhow::Result<Vec<(ThreadId, ThreadId, String)>> {
+        self.select::<(ThreadId, ThreadId, String)>(
+            "SELECT thread_id, parent_thread_id, quote FROM thread_parents",
+        )?()
+    }
+
+    pub async fn save_parent(
+        &self,
+        thread_id: ThreadId,
+        parent: ThreadParent,
+    ) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "INSERT INTO thread_parents(thread_id, parent_thread_id, quote) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(thread_id) DO UPDATE SET \
+                     parent_thread_id = excluded.parent_thread_id, \
+                     quote = excluded.quote",
+            )?;
+            let mut index = stmt.bind(&thread_id, 1)?;
+            index = stmt.bind(&parent.parent_thread_id, index)?;
+            stmt.bind(&parent.quote, index)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    pub async fn delete_parent(&self, thread_id: ThreadId) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut stmt =
+                Statement::prepare(conn, "DELETE FROM thread_parents WHERE thread_id = ?")?;
+            stmt.bind(&thread_id, 1)?;
+            stmt.exec()
+        })
+        .await
+    }
+
     pub async fn delete(&self, thread_id: ThreadId) -> anyhow::Result<()> {
         self.write(move |conn| {
             let mut stmt =

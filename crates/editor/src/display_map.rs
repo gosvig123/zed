@@ -166,6 +166,8 @@ pub enum HighlightKey {
     ColorizeBracket(usize),
     SemanticToken(u32),
     // below is sorted lexicographically, as there is no relevant ordering for these aside from coming after the above
+    /// Prose styles in the agent panel's transcript editor, one key per style.
+    AgentTranscript(usize),
     BufferSearchHighlights,
     ConsoleAnsiHighlight(usize),
     DebugStackFrameLine,

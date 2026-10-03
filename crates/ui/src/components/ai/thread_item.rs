@@ -63,6 +63,8 @@ pub struct ThreadItem {
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
+    metadata_suffix: Option<AnyElement>,
+    indent: usize,
     base_bg: Option<Hsla>,
 }
 
@@ -98,8 +100,23 @@ impl ThreadItem {
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
+            metadata_suffix: None,
+            indent: 0,
             base_bg: None,
         }
+    }
+
+    /// An element at the end of the metadata line, such as a control for nested items. The
+    /// title line is covered by the action slot on hover; this line is not.
+    pub fn metadata_suffix(mut self, element: impl IntoElement) -> Self {
+        self.metadata_suffix = Some(element.into_any_element());
+        self
+    }
+
+    /// Indents the row by `level` steps, for items nested under another item.
+    pub fn indent(mut self, level: usize) -> Self {
+        self.indent = level;
+        self
     }
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
@@ -418,7 +435,8 @@ impl RenderOnce for ThreadItem {
             || has_project_paths
             || has_worktree
             || has_diff_stats
-            || has_timestamp;
+            || has_timestamp
+            || self.metadata_suffix.is_some();
 
         v_flex()
             .id(self.id.clone())
@@ -430,6 +448,7 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
+            .when(self.indent > 0, |s| s.pl(px(6. + 16. * self.indent as f32)))
             .when(self.selected, |s| s.bg(color.ghost_element_selected))
             .border_1()
             .border_r_2()
@@ -604,6 +623,12 @@ impl RenderOnce for ThreadItem {
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
+                        })
+                        .when_some(self.metadata_suffix, |this, suffix| {
+                            this.when(has_timestamp || has_diff_stats, |this| {
+                                this.child(dot_separator())
+                            })
+                            .child(suffix)
                         }),
                 )
             })

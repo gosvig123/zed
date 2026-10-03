@@ -97,6 +97,58 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorAfterSend {
+    /// The caret stays in the composer, ready for the next message.
+    #[default]
+    NextMessage,
+    /// The caret moves to the start of the agent's response, for reading it with the keyboard.
+    Response,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentThreadLayout {
+    /// User messages are shown as bordered cards and every tool call as its own card.
+    #[default]
+    Chat,
+    /// The thread reads like a document: user messages are plain prose marked by an
+    /// avatar, runs of reads, searches, commands, and thinking fold into one summary
+    /// line, and the message editor sits at the end of the transcript.
+    Document,
+    /// The transcript is one read-only text editor, so the caret, selection, and every
+    /// editor motion move across all messages. Runs of reads, searches, commands, and
+    /// thinking fold into one summary line; edits, terminals, and prompts render as cards.
+    Editor,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -370,6 +422,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// How messages and tool calls are laid out in agent threads.
+    ///
+    /// Default: chat
+    pub thread_layout: Option<AgentThreadLayout>,
+    /// Where the caret goes after sending a message in the editor thread layout.
+    ///
+    /// Default: next_message
+    pub cursor_after_send: Option<CursorAfterSend>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///

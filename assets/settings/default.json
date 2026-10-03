@@ -1381,6 +1381,22 @@
     //
     // Default: auto
     "thinking_display": "auto",
+    // How messages and tool calls are laid out in agent threads.
+    // - "chat": user messages are bordered cards and every tool call is its own card.
+    // - "document": user messages are plain prose marked by an avatar, runs of
+    //   reads, searches, commands, and thinking fold into one summary line, and
+    //   you write the next message at the end of the transcript.
+    // - "editor": the transcript is one read-only text editor, so the caret and every
+    //   editor motion move across all messages.
+    //
+    // Default: chat
+    "thread_layout": "chat",
+    // Where the caret goes after sending a message in the "editor" thread layout.
+    // - "next_message": the caret stays in the composer.
+    // - "response": the caret moves to the start of the agent's response.
+    //
+    // Default: next_message
+    "cursor_after_send": "next_message",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //

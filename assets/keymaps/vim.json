@@ -1197,6 +1197,31 @@
       "enter": "agent::Chat",
     },
   },
+  {
+    // In the agent's editor thread layout, upward motions on the composer's first line continue
+    // in the transcript above, as if the composer were the document's last line.
+    "context": "AgentTranscriptComposer && first_line > Editor && VimControl && vim_mode == normal && !menu",
+    "bindings": {
+      "k": "agent::ContinueInTranscript",
+      "up": "agent::ContinueInTranscript",
+      "g g": ["agent::ContinueInTranscript", { "action": "vim::StartOfDocument" }],
+      "{": ["agent::ContinueInTranscript", { "action": "vim::StartOfParagraph" }],
+      "ctrl-u": ["agent::ContinueInTranscript", { "action": "vim::ScrollUp" }],
+      "ctrl-b": ["agent::ContinueInTranscript", { "action": "vim::PageUp" }],
+    },
+  },
+  {
+    // The transcript is read-only: commands that start typing continue in the composer.
+    "context": "AgentTranscript > Editor && VimControl && vim_mode == normal && !menu",
+    "bindings": {
+      "i": ["agent::ContinueInComposer", { "action": "vim::InsertEndOfLine" }],
+      "a": ["agent::ContinueInComposer", { "action": "vim::InsertEndOfLine" }],
+      "shift-i": ["agent::ContinueInComposer", { "action": "vim::InsertEndOfLine" }],
+      "shift-a": ["agent::ContinueInComposer", { "action": "vim::InsertEndOfLine" }],
+      "o": ["agent::ContinueInComposer", { "action": "vim::InsertEndOfLine" }],
+      "shift-o": ["agent::ContinueInComposer", { "action": "vim::InsertEndOfLine" }],
+    },
+  },
 
   {
     "context": "SettingsWindow > NavigationMenu && !search",

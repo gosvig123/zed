@@ -323,6 +323,17 @@ actions!(
         ScrollOutputToNextMessage,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
+        /// Reverts the conversation to the cursor in the editor thread layout: messages after
+        /// the cursor are removed and project files are restored, after confirmation. With
+        /// the cursor in one of your messages, that message is removed too.
+        RevertConversationToCursor,
+        /// Copies the agent response at the cursor, or the latest response, as Markdown.
+        CopyAgentResponse,
+        /// Copies the whole thread as Markdown.
+        CopyThreadAsMarkdown,
+        /// Comments on the selected passage of the transcript in the editor thread layout.
+        /// Comments are sent with your next message, and the agent replies to each one.
+        AddComment,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
@@ -528,6 +539,40 @@ pub enum AgentInitialContent {
 impl From<ExternalSourcePrompt> for AgentInitialContent {
     fn from(prompt: ExternalSourcePrompt) -> Self {
         Self::FromExternalSource(prompt)
+    }
+}
+
+/// Moves from the composer into the transcript text above it, at the same column, in the
+/// editor thread layout. With `action`, then runs that action in the transcript, for example a
+/// vim motion such as `vim::StartOfDocument`.
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct ContinueInTranscript {
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// Moves from the transcript to the composer in the editor thread layout. With `action`, then
+/// runs that action in the composer, for example `vim::InsertEndOfLine`.
+#[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct ContinueInComposer {
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// Runs an action named in a key binding on a focus target, reporting a bad name in the log.
+pub(crate) fn dispatch_named_action(
+    name: &str,
+    focus_handle: &gpui::FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match cx.build_action(name, None) {
+        Ok(action) => focus_handle.dispatch_action(&*action, window, cx),
+        Err(error) => log::error!("Unknown action {name:?} in a key binding: {error}"),
     }
 }
 
@@ -1033,6 +1078,8 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            thread_layout: Default::default(),
+            cursor_after_send: Default::default(),
         };
 
         cx.update(|cx| {

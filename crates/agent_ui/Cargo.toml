@@ -86,6 +86,7 @@ postage.workspace = true
 project.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
+pulldown-cmark.workspace = true
 rand.workspace = true
 release_channel.workspace = true
 remote.workspace = true

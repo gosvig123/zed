@@ -291,6 +291,7 @@ impl EntryViewState {
                         if !is_editable {
                             editor.set_read_only(true, cx);
                         }
+                        editor.set_transparent_background(true);
                         editor.set_source_message(source_blocks, window, cx);
                         editor
                     });

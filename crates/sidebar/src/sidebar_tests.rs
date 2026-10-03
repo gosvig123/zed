@@ -1507,6 +1507,9 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             highlight_positions: Vec::new(),
             worktrees: Vec::new(),
             diff_stats: DiffStats::default(),
+            depth: 0,
+            subthread_count: 0,
+            subthreads_expanded: false,
         }))
     };
 
@@ -1599,6 +1602,9 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                depth: 0,
+                subthread_count: 0,
+                subthreads_expanded: false,
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1626,6 +1632,9 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                depth: 0,
+                subthread_count: 0,
+                subthreads_expanded: false,
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1653,6 +1662,9 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                depth: 0,
+                subthread_count: 0,
+                subthreads_expanded: false,
             })),
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
@@ -1681,6 +1693,9 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                depth: 0,
+                subthread_count: 0,
+                subthreads_expanded: false,
             })),
             // Background thread that completed (should show notification)
             // remote_connection: None,
@@ -1709,6 +1724,9 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                depth: 0,
+                subthread_count: 0,
+                subthreads_expanded: false,
             })),
             // Collapsed project header
             ListEntry::ProjectHeader {

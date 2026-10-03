@@ -207,6 +207,7 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    transparent_background: bool,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -610,9 +611,15 @@ impl MessageEditor {
             local_commands,
             agent_id,
             thread_store,
+            transparent_background: false,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
+    }
+
+    /// Lets the container paint the background, so a message can render as plain prose.
+    pub fn set_transparent_background(&mut self, transparent_background: bool) {
+        self.transparent_background = transparent_background;
     }
 
     pub fn set_local_commands(&self, commands: Vec<PromptLocalCommand>) {
@@ -2081,22 +2088,45 @@ impl Render for MessageEditor {
             .flex_1()
             .child({
                 let settings = ThemeSettings::get_global(cx);
+                let document_layout = matches!(
+                    agent_settings::AgentSettings::get_global(cx).thread_layout,
+                    settings::AgentThreadLayout::Document | settings::AgentThreadLayout::Editor
+                );
 
-                let text_style = TextStyle {
-                    color: cx.theme().colors().text,
-                    font_family: settings.agent_buffer_font_family().clone(),
-                    font_fallbacks: settings.buffer_font.fallbacks.clone(),
-                    font_features: settings.buffer_font.features.clone(),
-                    font_size: settings.agent_buffer_font_size(cx).into(),
-                    font_weight: settings.buffer_font.weight,
-                    line_height: relative(settings.buffer_line_height.value()),
-                    ..Default::default()
+                // In the document layout, user messages read as prose, so they match the
+                // agent's Markdown body text rather than code.
+                let text_style = if document_layout {
+                    TextStyle {
+                        color: cx.theme().colors().text,
+                        font_family: settings.agent_ui_font_family().clone(),
+                        font_fallbacks: settings.ui_font.fallbacks.clone(),
+                        font_features: settings.ui_font.features.clone(),
+                        font_size: settings.agent_ui_font_size(cx).into(),
+                        font_weight: settings.ui_font.weight,
+                        line_height: (settings.agent_buffer_font_size(cx) * 1.75).into(),
+                        ..Default::default()
+                    }
+                } else {
+                    TextStyle {
+                        color: cx.theme().colors().text,
+                        font_family: settings.agent_buffer_font_family().clone(),
+                        font_fallbacks: settings.buffer_font.fallbacks.clone(),
+                        font_features: settings.buffer_font.features.clone(),
+                        font_size: settings.agent_buffer_font_size(cx).into(),
+                        font_weight: settings.buffer_font.weight,
+                        line_height: relative(settings.buffer_line_height.value()),
+                        ..Default::default()
+                    }
                 };
 
                 EditorElement::new(
                     &self.editor,
                     EditorStyle {
-                        background: cx.theme().colors().editor_background,
+                        background: if self.transparent_background || document_layout {
+                            gpui::transparent_black()
+                        } else {
+                            cx.theme().colors().editor_background
+                        },
                         local_player: cx.theme().players().local(),
                         text: text_style,
                         syntax: cx.theme().syntax().clone(),

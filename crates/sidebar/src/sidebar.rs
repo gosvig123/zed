@@ -365,6 +365,10 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    /// 1 for a thread started from a comment in the thread listed above it.
+    depth: usize,
+    subthread_count: usize,
+    subthreads_expanded: bool,
 }
 
 #[derive(Clone)]
@@ -784,6 +788,8 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
+    /// Threads whose subthreads are shown. Subthreads are folded by default.
+    expanded_subthread_parents: HashSet<agent_ui::ThreadId>,
     rename_target: Option<RenameTarget>,
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
@@ -948,6 +954,7 @@ impl Sidebar {
             selection: None,
             active_entry: None,
             hovered_thread_index: None,
+            expanded_subthread_parents: HashSet::new(),
             rename_target: None,
             regenerating_titles: HashSet::new(),
             suppress_next_rename_edit: false,
@@ -1633,6 +1640,9 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            depth: 0,
+                            subthread_count: 0,
+                            subthreads_expanded: false,
                         })
                     };
 
@@ -1944,10 +1954,12 @@ impl Sidebar {
                     has_threads,
                 });
 
+                // Search results stay flat, so a matching subthread is never folded away.
                 Self::push_entries_by_display_time(
                     &mut entries,
                     matched_terminals,
                     matched_threads,
+                    None,
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
@@ -1994,10 +2006,23 @@ impl Sidebar {
                     continue;
                 }
 
+                let parents: HashMap<agent_ui::ThreadId, agent_ui::ThreadId> = {
+                    let store = ThreadMetadataStore::global(cx).read(cx);
+                    threads
+                        .iter()
+                        .filter_map(|thread| {
+                            let thread_id = thread.metadata.thread_id;
+                            store
+                                .parent_of(thread_id)
+                                .map(|parent| (thread_id, parent.parent_thread_id))
+                        })
+                        .collect()
+                };
                 Self::push_entries_by_display_time(
                     &mut entries,
                     terminals,
                     threads,
+                    Some((&parents, &self.expanded_subthread_parents)),
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
@@ -5822,10 +5847,16 @@ impl Sidebar {
         metadata.interacted_at.unwrap_or(metadata.updated_at)
     }
 
+    /// With `nesting` (each subthread's parent, and the parents shown expanded), a subthread
+    /// whose parent is listed follows its parent, and only while that parent is expanded.
     fn push_entries_by_display_time(
         entries: &mut Vec<ListEntry>,
         terminals: Vec<TerminalEntry>,
         threads: Vec<Arc<ThreadEntry>>,
+        nesting: Option<(
+            &HashMap<agent_ui::ThreadId, agent_ui::ThreadId>,
+            &HashSet<agent_ui::ThreadId>,
+        )>,
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
     ) {
@@ -5840,20 +5871,78 @@ impl Sidebar {
             }
         }
 
+        let listed: HashSet<agent_ui::ThreadId> = threads
+            .iter()
+            .map(|thread| thread.metadata.thread_id)
+            .collect();
+        let parent_of = |thread: &ThreadEntry| {
+            let (parents, _) = nesting?;
+            parents
+                .get(&thread.metadata.thread_id)
+                .copied()
+                .filter(|parent| listed.contains(parent))
+        };
+        let mut children: HashMap<agent_ui::ThreadId, Vec<Arc<ThreadEntry>>> = HashMap::new();
+        let mut top_level = Vec::new();
+        for thread in threads {
+            match parent_of(&thread) {
+                Some(parent) => children.entry(parent).or_default().push(thread),
+                None => top_level.push(thread),
+            }
+        }
+        let expanded = nesting.map(|(_, expanded)| expanded);
+
+        // A parent sorts by its latest activity, including its subthreads.
+        let sort_time = |entry: &ListEntry| {
+            let subthread_time = match entry {
+                ListEntry::Thread(thread) => children
+                    .get(&thread.metadata.thread_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|subthread| Sidebar::thread_display_time(&subthread.metadata))
+                    .max(),
+                _ => None,
+            };
+            display_time(entry).max(subthread_time.unwrap_or(DateTime::<Utc>::MIN_UTC))
+        };
         let row_entries = terminals
             .into_iter()
             .map(ListEntry::Terminal)
-            .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .chain(top_level.into_iter().map(ListEntry::Thread))
+            .sorted_by_key(|right| std::cmp::Reverse(sort_time(right)));
 
-        for entry in row_entries {
-            if let ListEntry::Thread(thread) = &entry {
-                if let Some(session_id) = &thread.metadata.session_id {
-                    current_session_ids.insert(session_id.clone());
+        let mut record = |thread: &ThreadEntry| {
+            if let Some(session_id) = &thread.metadata.session_id {
+                current_session_ids.insert(session_id.clone());
+            }
+            current_thread_ids.insert(thread.metadata.thread_id);
+        };
+        for mut entry in row_entries {
+            let mut nested = Vec::new();
+            if let ListEntry::Thread(thread) = &mut entry {
+                let thread_id = thread.metadata.thread_id;
+                if let Some(mut subthreads) = children.remove(&thread_id) {
+                    let is_expanded =
+                        expanded.is_some_and(|expanded| expanded.contains(&thread_id));
+                    let parent = Arc::make_mut(thread);
+                    parent.subthread_count = subthreads.len();
+                    parent.subthreads_expanded = is_expanded;
+                    subthreads.sort_by_key(|subthread| {
+                        std::cmp::Reverse(Sidebar::thread_display_time(&subthread.metadata))
+                    });
+                    for subthread in &mut subthreads {
+                        // Folded subthreads still count, so their notifications survive.
+                        record(subthread);
+                        Arc::make_mut(subthread).depth = 1;
+                    }
+                    if is_expanded {
+                        nested = subthreads;
+                    }
                 }
-                current_thread_ids.insert(thread.metadata.thread_id);
+                record(thread);
             }
             entries.push(entry);
+            entries.extend(nested.into_iter().map(ListEntry::Thread));
         }
     }
 
@@ -6301,8 +6390,49 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
+        let subthread_toggle = (thread.subthread_count > 0).then(|| {
+            let parent_thread_id = thread.metadata.thread_id;
+            let chevron = if thread.subthreads_expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            let label = if thread.subthread_count == 1 {
+                "1 subthread".to_string()
+            } else {
+                format!("{} subthreads", thread.subthread_count)
+            };
+            ui::ButtonLike::new(("subthreads", ix))
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                        .child(
+                            Icon::new(chevron)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .tooltip(Tooltip::text(if thread.subthreads_expanded {
+                    "Hide Subthreads"
+                } else {
+                    "Show Subthreads"
+                }))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    if !this.expanded_subthread_parents.remove(&parent_thread_id) {
+                        this.expanded_subthread_parents.insert(parent_thread_id);
+                    }
+                    this.update_entries(cx);
+                    cx.stop_propagation();
+                }))
+        });
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .indent(thread.depth)
+            .when_some(subthread_toggle, |this, toggle| {
+                this.metadata_suffix(toggle)
+            })
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))

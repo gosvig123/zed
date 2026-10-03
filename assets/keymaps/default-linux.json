@@ -235,6 +235,14 @@
     },
   },
   {
+    "context": "AgentTranscriptComment > Editor",
+    "bindings": {
+      "escape": "menu::Cancel",
+      "enter": "menu::Confirm",
+      "alt-enter": "editor::Newline",
+    },
+  },
+  {
     "context": "AcpThread > ModeSelector",
     "bindings": {
       "ctrl-enter": "menu::Confirm",
